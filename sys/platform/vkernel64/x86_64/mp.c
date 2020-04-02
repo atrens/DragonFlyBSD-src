@@ -35,6 +35,7 @@
 #include <sys/cpumask.h>
 #include <sys/interrupt.h>
 #include <sys/kernel.h>
+#include <sys/malloc.h>
 #include <sys/memrange.h>
 #include <sys/tls.h>
 #include <sys/types.h>
@@ -165,6 +166,8 @@ mp_start(void)
                 ++shift;
         ncpus_fit = 1 << shift;
         ncpus_fit_mask = ncpus_fit - 1;
+
+	malloc_reinit_ncpus();
 
 	/*
 	 * cpu0 initialization

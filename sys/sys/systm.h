@@ -96,16 +96,25 @@ extern int nfs_diskless_valid;	/* NFS diskless params were obtained */
 extern vm_paddr_t Maxmem;	/* Highest physical memory address in system */
 
 #ifdef	INVARIANTS		/* The option is always available */
-#define	KASSERT(exp,msg)	do { if (__predict_false(!(exp)))	\
+#define	KASSERT(exp,msg)	do { if (__predict_false(!(exp)))	  \
 					panic msg; } while (0)
+
 #define KKASSERT(exp)		do { if (__predict_false(!(exp)))	  \
 					panic("assertion \"%s\" failed "  \
 					"in %s at %s:%u", #exp, __func__, \
 					__FILE__, __LINE__); } while (0)
+
+#define KKASSERT_UNSPIN(exp, spin)					  \
+				do { if (__predict_false(!(exp))) { 	  \
+					spin_unlock_any(spin);		  \
+					panic("assertion \"%s\" failed "  \
+					"in %s at %s:%u", #exp, __func__, \
+					__FILE__, __LINE__); } } while (0)
 #define __debugvar
 #else
-#define	KASSERT(exp,msg)	do { } while (0)
-#define	KKASSERT(exp)		do { } while (0)
+#define	KASSERT(exp,msg)		do { } while (0)
+#define	KKASSERT(exp)			do { } while (0)
+#define	KKASSERT_UNSPIN(exp, spin)	do { } while (0)
 #define __debugvar		__attribute__((__unused__))
 #endif
 
@@ -419,11 +428,11 @@ void	wakeup_end_delayed(void);
 
 int major(cdev_t x);
 int minor(cdev_t x);
-udev_t dev2udev(cdev_t x);
-cdev_t udev2dev(udev_t x, int b);
-int uminor(udev_t dev);
-int umajor(udev_t dev);
-udev_t makeudev(int x, int y);
+dev_t devid_from_dev(cdev_t x);
+cdev_t dev_from_devid(dev_t x, int b);
+int uminor(dev_t dev);
+int umajor(dev_t dev);
+dev_t makeudev(int x, int y);
 
 /*
  * Unit number allocation API. (kern/subr_unit.c)

@@ -254,6 +254,9 @@ struct rt_msghdr {
  */
 #define	ROUTE_MSGFILTER	1	/* bitmask of which rtm_type to send to client */
 #define	ROUTE_FILTER(m)	(1U << (m))
+#define	RO_MISSFILTER	2	/* array of sockaddrs to match miss dst */
+
+#define	RO_FILTSA_MAX	30	/* maximum number of sockaddrs per filter */
 
 /*
  * Bitmask values for rtm_inits and rmx_locks.
@@ -433,7 +436,7 @@ rtmask_purelookup(struct sockaddr *_mask)
 
 void	rt_print(struct rt_addrinfo *, struct rtentry *);
 void	rt_addrinfo_print(int cmd, struct rt_addrinfo *);
-void	sockaddr_print(struct sockaddr *);
+void	sockaddr_print(const struct sockaddr *);
 
 #ifndef _SYS_GLOBALDATA_H_
 #include <sys/globaldata.h>

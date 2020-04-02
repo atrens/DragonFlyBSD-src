@@ -356,6 +356,7 @@ hammer_get_vnode(hammer_inode_t ip, struct vnode **vpp)
 					  hammer_blocksize(ip->ino_data.size),
 					  hammer_blockoff(ip->ino_data.size));
 			}
+			vx_downgrade(vp);
 			break;
 		}
 
@@ -1181,7 +1182,7 @@ hammer_unload_pseudofs_callback(hammer_inode_t ip, void *data)
 		 * Don't allow any subdirectories or files to be open.
 		 */
 		if (hammer_isactive(&ip->lock) == 2 && ip->vp)
-			vclean_unlocked(ip->vp);
+			vclean_unlocked(ip->vp);	/* might not succeed */
 		if (hammer_isactive(&ip->lock) == 1 && ip->vp == NULL)
 			res = 0;
 		else
@@ -1698,7 +1699,7 @@ hammer_modify_inode(hammer_transaction_t trans, hammer_inode_t ip, int flags)
 int
 hammer_update_atime_quick(hammer_inode_t ip)
 {
-	struct timeval tv;
+	struct timespec ts;
 	int res = -1;
 
 	if ((ip->flags & HAMMER_INODE_RO) ||
@@ -1713,11 +1714,12 @@ hammer_update_atime_quick(hammer_inode_t ip)
 		 * is only safe if all we need to do is update
 		 * ino_data.atime.
 		 */
-		getmicrotime(&tv);
+		vfs_timestamp(&ts);
 		hammer_lock_ex(&ip->lock);
 		if (ip->flags & HAMMER_INODE_ATIME) {
 			ip->ino_data.atime =
-			    (unsigned long)tv.tv_sec * 1000000ULL + tv.tv_usec;
+			    (unsigned long)ts.tv_sec * 1000000ULL +
+			    ts.tv_nsec / 1000;
 			res = 0;
 		}
 		hammer_unlock(&ip->lock);

@@ -216,17 +216,33 @@ struct vm_page;
 struct vm_object;
 struct vmspace;
 
+#define PMAP_ADVANCED
+
 /*
  * vm_page structure extension for pmap.  Track the number of pmap mappings
  * for a managed page.  Unmanaged pages do not use this field.
  */
 struct md_page {
+#ifdef PMAP_ADVANCED
+	long interlock_count;
+	long writeable_count_unused;
+#else
 	long pmap_count;
 	long writeable_count;
+#endif
 };
+
+#ifdef PMAP_ADVANCED
+
+#define MD_PAGE_FREEABLE(m)	\
+	(((m)->flags & (PG_MAPPED | PG_WRITEABLE)) == 0)
+
+#else
 
 #define MD_PAGE_FREEABLE(m)	\
 	((m)->md.pmap_count == 0 && (m)->md.writeable_count == 0)
+
+#endif
 
 /*
  * vm_object's representing large mappings can contain embedded pmaps
@@ -303,8 +319,10 @@ struct pmap {
 	long			pm_invgen;
 	uint64_t		pmap_bits[PG_BITS_SIZE];
 	uint64_t		protection_codes[PROTECTION_CODES_SIZE];
-	pt_entry_t		pmap_cache_bits[PAT_INDEX_SIZE];
-	pt_entry_t		pmap_cache_mask;
+	pt_entry_t		pmap_cache_bits_pte[PAT_INDEX_SIZE];
+	pt_entry_t		pmap_cache_bits_pde[PAT_INDEX_SIZE];
+	pt_entry_t		pmap_cache_mask_pte;
+	pt_entry_t		pmap_cache_mask_pde;
 	int (*copyinstr)(const void *, void *, size_t, size_t *);
 	int (*copyin)(const void *, void *, size_t);
 	int (*copyout)(const void *, void *, size_t);

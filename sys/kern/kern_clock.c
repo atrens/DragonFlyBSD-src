@@ -122,10 +122,12 @@ struct kinfo_pcheader cputime_pcheader = { PCTRACK_SIZE, PCTRACK_ARYSIZE };
 struct kinfo_pctrack cputime_pctrack[MAXCPU][PCTRACK_SIZE];
 #endif
 
-static int sniff_enable = 1;
-static int sniff_target = -1;
+__read_mostly static int sniff_enable = 1;
+__read_mostly static int sniff_target = -1;
+__read_mostly static int clock_debug2 = 0;
 SYSCTL_INT(_kern, OID_AUTO, sniff_enable, CTLFLAG_RW, &sniff_enable, 0 , "");
 SYSCTL_INT(_kern, OID_AUTO, sniff_target, CTLFLAG_RW, &sniff_target, 0 , "");
+SYSCTL_INT(_debug, OID_AUTO, clock_debug2, CTLFLAG_RW, &clock_debug2, 0 , "");
 
 static int
 sysctl_cputime(SYSCTL_HANDLER_ARGS)
@@ -227,9 +229,12 @@ SYSCTL_PROC(_kern, OID_AUTO, cp_times, (CTLTYPE_LONG|CTLFLAG_RD), 0, 0,
  *          time_second, time_uptime is not a "real" time_t (seconds
  *          since the Epoch) but seconds since booting.
  */
-struct timespec boottime;	/* boot time (realtime) for reference only */
-time_t time_second;		/* read-only 'passive' realtime in seconds */
-time_t time_uptime;		/* read-only 'passive' uptime in seconds */
+__read_mostly struct timespec boottime;	/* boot time (realtime) for ref only */
+__read_mostly struct timespec ticktime0;/* updated every tick */
+__read_mostly struct timespec ticktime2;/* updated every tick */
+__read_mostly int ticktime_update;
+__read_mostly time_t time_second;	/* read-only 'passive' rt in seconds */
+__read_mostly time_t time_uptime;	/* read-only 'passive' ut in seconds */
 
 /*
  * basetime is used to calculate the compensated real time of day.  The
@@ -283,11 +288,15 @@ static void statclock(systimer_t info, int, struct intrframe *frame);
 static void schedclock(systimer_t info, int, struct intrframe *frame);
 static void getnanotime_nbt(struct timespec *nbt, struct timespec *tsp);
 
-int	ticks;			/* system master ticks at hz */
-int	clocks_running;		/* tsleep/timeout clocks operational */
+/*
+ * Use __read_mostly for ticks and sched_ticks because these variables are
+ * used all over the kernel and only updated once per tick.
+ */
+__read_mostly int ticks;		/* system master ticks at hz */
+__read_mostly int sched_ticks;		/* global schedule clock ticks */
+__read_mostly int clocks_running;	/* tsleep/timeout clocks operational */
 int64_t	nsec_adj;		/* ntpd per-tick adjustment in nsec << 32 */
 int64_t	nsec_acc;		/* accumulator */
-int	sched_ticks;		/* global schedule clock ticks */
 
 /* NTPD time correction fields */
 int64_t	ntp_tick_permanent;	/* per-tick adjustment in nsec << 32 */
@@ -417,13 +426,17 @@ initclocks_other(void *dummy)
 		 *
 		 * Install statclock before hardclock to prevent statclock
 		 * from misinterpreting gd_flags for tick assignment when
-		 * they overlap.
+		 * they overlap.  Also offset the statclock by half of
+		 * its interval to try to avoid being coincident with
+		 * callouts.
 		 */
 		systimer_init_periodic_flags(&gd->gd_statclock, statclock,
 					  NULL, stathz,
-					  SYSTF_MSSYNC | SYSTF_FIRST);
+					  SYSTF_MSSYNC | SYSTF_FIRST |
+					  SYSTF_OFFSET50 | SYSTF_OFFSETCPU);
 		systimer_init_periodic_flags(&gd->gd_hardclock, hardclock,
-					  NULL, hz, SYSTF_MSSYNC);
+					  NULL, hz,
+					  SYSTF_MSSYNC | SYSTF_OFFSETCPU);
 	}
 	lwkt_setcpu_self(ogd);
 
@@ -592,7 +605,23 @@ hardclock(systimer_t info, int in_ipi, struct intrframe *frame)
 	    int leap;
 	    int ni;
 
+	    /*
+	     * Update system-wide ticks
+	     */
 	    ++ticks;
+
+	    /*
+	     * Update system-wide ticktime for getnanotime() and getmicrotime()
+	     */
+	    nanotime(&nts);
+	    atomic_add_int_nonlocked(&ticktime_update, 1);
+	    cpu_sfence();
+	    if (ticktime_update & 2)
+		ticktime2 = nts;
+	    else
+		ticktime0 = nts;
+	    cpu_sfence();
+	    atomic_add_int_nonlocked(&ticktime_update, 1);
 
 #if 0
 	    if (tco->tc_poll_pps) 
@@ -723,7 +752,6 @@ hardclock(systimer_t info, int in_ipi, struct intrframe *frame)
 		 * thread which may no longer care.
 		 */
 		curthread->td_wakefromcpu = -1;
-
 	    }
 
 	    /*
@@ -865,6 +893,14 @@ statclock(systimer_t info, int in_ipi, struct intrframe *frame)
 	td = curthread;
 	p = td->td_proc;
 
+	/*
+	 * If this is an interrupt thread used for the clock interrupt, adjust
+	 * td to the thread it is preempting.  If a frame is available, it will
+	 * be related to the thread being preempted.
+	 */
+	if ((td->td_flags & TDF_CLKTHREAD) && td->td_preempted)
+		td = td->td_preempted;
+
 	if (frame && CLKF_USERMODE(frame)) {
 		/*
 		 * Came from userland, handle user time and deal with
@@ -893,8 +929,6 @@ statclock(systimer_t info, int in_ipi, struct intrframe *frame)
 			--intr_nest;
 		}
 
-#define IS_INTR_RUNNING	((frame && CLKF_INTR(intr_nest)) || CLKF_INTR_TD(td))
-
 		/*
 		 * Came from kernel mode, so we were:
 		 * - handling an interrupt,
@@ -910,8 +944,8 @@ statclock(systimer_t info, int in_ipi, struct intrframe *frame)
 		 * XXX assume system if frame is NULL.  A NULL frame 
 		 * can occur if ipi processing is done from a crit_exit().
 		 */
-		if (IS_INTR_RUNNING ||
-		    (gd->gd_reqflags & RQF_INTPEND)) {
+		if ((frame && CLKF_INTR(intr_nest)) ||
+		    cpu_interrupt_running(td)) {
 			/*
 			 * If we interrupted an interrupt thread, well,
 			 * count it as interrupt time.
@@ -941,6 +975,10 @@ statclock(systimer_t info, int in_ipi, struct intrframe *frame)
 			else
 				cpu_time.cp_user += bump;
 		} else {
+			if (clock_debug2 > 0) {
+				--clock_debug2;
+				kprintf("statclock preempt %s (%p %p)\n", td->td_comm, td, &gd->gd_idlethread);
+			}
 			td->td_sticks += bump;
 			if (td == &gd->gd_idlethread) {
 				/*
@@ -950,11 +988,19 @@ statclock(systimer_t info, int in_ipi, struct intrframe *frame)
 				 * section while switching through the idle
 				 * thread.  In this situation, various flags
 				 * will be set in gd_reqflags.
+				 *
+				 * INTPEND is not necessarily useful because
+				 * it will be set if the clock interrupt
+				 * happens to be on an interrupt thread, the
+				 * cpu_interrupt_running() call does a better
+				 * job so we've already handled it.
 				 */
-				if (gd->gd_reqflags & RQF_IDLECHECK_WK_MASK)
+				if (gd->gd_reqflags &
+				    (RQF_IDLECHECK_WK_MASK & ~RQF_INTPEND)) {
 					cpu_time.cp_sys += bump;
-				else
+				} else {
 					cpu_time.cp_idle += bump;
+				}
 			} else {
 				/*
 				 * System thread was running.
@@ -966,8 +1012,6 @@ statclock(systimer_t info, int in_ipi, struct intrframe *frame)
 				cpu_time.cp_sys += bump;
 			}
 		}
-
-#undef IS_INTR_RUNNING
 	}
 }
 
@@ -1274,6 +1318,11 @@ SYSCTL_PROC(_kern, KERN_CLOCKRATE, clockrate, CTLTYPE_STRUCT|CTLFLAG_RD,
  * uniformity we deal with the case in the usec case too.
  *
  * All the [get][micro,nano][time,uptime]() routines are MPSAFE.
+ *
+ * NEW CODE (!)
+ *
+ *	cpu 0 now maintains global ticktimes and an update counter.  The
+ *	getnanotime() and getmicrotime() routines use these globals.
  */
 void
 getmicrouptime(struct timeval *tvp)
@@ -1357,57 +1406,58 @@ nanouptime(struct timespec *tsp)
 void
 getmicrotime(struct timeval *tvp)
 {
-	struct globaldata *gd = mycpu;
-	struct timespec *bt;
-	sysclock_t delta;
+	struct timespec ts;
+	int counter;
 
 	do {
-		tvp->tv_sec = gd->gd_time_seconds;
-		delta = gd->gd_hardclock.time - gd->gd_cpuclock_base;
-	} while (tvp->tv_sec != gd->gd_time_seconds);
-
-	if (delta >= sys_cputimer->freq) {
-		tvp->tv_sec += delta / sys_cputimer->freq;
-		delta %= sys_cputimer->freq;
-	}
-	tvp->tv_usec = (sys_cputimer->freq64_usec * delta) >> 32;
-
-	bt = &basetime[basetime_index];
-	cpu_lfence();
-	tvp->tv_sec += bt->tv_sec;
-	tvp->tv_usec += bt->tv_nsec / 1000;
-	while (tvp->tv_usec >= 1000000) {
-		tvp->tv_usec -= 1000000;
-		++tvp->tv_sec;
-	}
+		counter = *(volatile int *)&ticktime_update;
+		cpu_lfence();
+		switch(counter & 3) {
+		case 0:			/* ticktime2 completed update */
+			ts = ticktime2;
+			break;
+		case 1:			/* ticktime0 update in progress */
+			ts = ticktime2;
+			break;
+		case 2:			/* ticktime0 completed update */
+			ts = ticktime0;
+			break;
+		case 3:			/* ticktime2 update in progress */
+			ts = ticktime0;
+			break;
+		}
+		cpu_lfence();
+	} while (counter != *(volatile int *)&ticktime_update);
+	tvp->tv_sec = ts.tv_sec;
+	tvp->tv_usec = ts.tv_nsec / 1000;
 }
 
 void
 getnanotime(struct timespec *tsp)
 {
-	struct globaldata *gd = mycpu;
-	struct timespec *bt;
-	sysclock_t delta;
+	struct timespec ts;
+	int counter;
 
 	do {
-		tsp->tv_sec = gd->gd_time_seconds;
-		delta = gd->gd_hardclock.time - gd->gd_cpuclock_base;
-	} while (tsp->tv_sec != gd->gd_time_seconds);
-
-	if (delta >= sys_cputimer->freq) {
-		tsp->tv_sec += delta / sys_cputimer->freq;
-		delta %= sys_cputimer->freq;
-	}
-	tsp->tv_nsec = (sys_cputimer->freq64_nsec * delta) >> 32;
-
-	bt = &basetime[basetime_index];
-	cpu_lfence();
-	tsp->tv_sec += bt->tv_sec;
-	tsp->tv_nsec += bt->tv_nsec;
-	while (tsp->tv_nsec >= 1000000000) {
-		tsp->tv_nsec -= 1000000000;
-		++tsp->tv_sec;
-	}
+		counter = *(volatile int *)&ticktime_update;
+		cpu_lfence();
+		switch(counter & 3) {
+		case 0:			/* ticktime2 completed update */
+			ts = ticktime2;
+			break;
+		case 1:			/* ticktime0 update in progress */
+			ts = ticktime2;
+			break;
+		case 2:			/* ticktime0 completed update */
+			ts = ticktime0;
+			break;
+		case 3:			/* ticktime2 update in progress */
+			ts = ticktime0;
+			break;
+		}
+		cpu_lfence();
+	} while (counter != *(volatile int *)&ticktime_update);
+	*tsp = ts;
 }
 
 static void

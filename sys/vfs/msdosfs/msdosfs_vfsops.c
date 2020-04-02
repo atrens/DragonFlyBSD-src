@@ -590,7 +590,7 @@ mountmsdosfs(struct vnode *devvp, struct mount *mp, struct msdosfs_args *argp)
 	else
 		pmp->pm_fmod = 1;
 	mp->mnt_data = (qaddr_t) pmp;
-	mp->mnt_stat.f_fsid.val[0] = dev2udev(dev);
+	mp->mnt_stat.f_fsid.val[0] = devid_from_dev(dev);
 	mp->mnt_stat.f_fsid.val[1] = mp->mnt_vfc->vfc_typenum;
 	mp->mnt_flag |= MNT_LOCAL;
 	vfs_add_vnodeops(mp, &msdosfs_vnode_vops, &mp->mnt_vn_norm_ops);
@@ -867,6 +867,7 @@ msdosfs_vptofh(struct vnode *vp, struct fid *fhp)
 }
 
 static struct vfsops msdosfs_vfsops = {
+	.vfs_flags =		0,
 	.vfs_mount =		msdosfs_mount,
 	.vfs_root =		msdosfs_root,
 	.vfs_statfs =		msdosfs_statfs,

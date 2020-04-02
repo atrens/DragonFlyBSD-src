@@ -30,12 +30,9 @@
  * SUCH DAMAGE.
  */
 
-#if HAVE_NBTOOL_CONFIG_H
-#include "nbtool_config.h"
-#endif
-
 #include <sys/param.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -124,7 +121,10 @@ do {									\
 int
 compare(NODE *s, FTSENT *p)
 {
-	u_int32_t len, val, flags;
+	u_int32_t len, val;
+#if HAVE_STRUCT_STAT_ST_FLAGS
+	u_int32_t flags;
+#endif
 	int fd, label;
 	const char *cp, *tab;
 #if !defined(NO_MD5) || !defined(NO_RMD160) || !defined(NO_SHA)
@@ -314,7 +314,7 @@ typeerr:		LABEL;
 		struct stat *ps = p->fts_statp;
 		time_t smtime = s->st_mtimespec.tv_sec;
 
-#if defined(BSD4_4) && !defined(HAVE_NBTOOL_CONFIG_H)
+#if defined(BSD4_4)
 		time_t pmtime = ps->st_mtimespec.tv_sec;
 
 		TIMESPEC_TO_TIMEVAL(&tv[0], &s->st_mtimespec);

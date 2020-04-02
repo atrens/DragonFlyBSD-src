@@ -176,7 +176,7 @@ void ldisc_deregister (int);
  * Swap device table
  */
 struct swdevt {
-	udev_t	sw_dev;			/* For quasibogus swapdev reporting */
+	dev_t	sw_dev;			/* For quasibogus swapdev reporting */
 	int	sw_flags;
 	int	sw_nblks;		/* Number of swap blocks on device */
 	int	sw_nused;		/* swap blocks used on device */
@@ -216,15 +216,11 @@ DECLARE_MODULE(name, name##_mod, SI_SUB_DRIVERS, SI_ORDER_MIDDLE)
 int	count_dev (cdev_t dev);
 void	destroy_dev (cdev_t dev);
 void	release_dev (cdev_t dev);
-cdev_t	get_dev (int x, int y);
 cdev_t	reference_dev (cdev_t dev);
-struct dev_ops *devsw (cdev_t dev);
 const char *devtoname (cdev_t dev);
-void	freedev (cdev_t dev);
 int	iszerodev (cdev_t dev);
 
 int	lminor (cdev_t dev);
-void	setconf (void);
 cdev_t	kgetdiskbyname(const char *name);
 int	dev_is_good(cdev_t dev);
 

@@ -80,6 +80,7 @@ static void mount_warning(struct mount *mp, const char *ctl, ...)
 static int mount_path(struct proc *p, struct mount *mp, char **rb, char **fb);
 static int checkvp_chdir (struct vnode *vn, struct thread *td);
 static void checkdirs (struct nchandle *old_nch, struct nchandle *new_nch);
+static int get_fspriv(const char *);
 static int chroot_refuse_vdir_fds (thread_t td, struct filedesc *fdp);
 static int chroot_visible_mnt(struct mount *mp, struct proc *p);
 static int getutimes (struct timeval *, struct timespec *);
@@ -118,31 +119,47 @@ sys_mount(struct mount_args *uap)
 	struct vfsconf *vfsp;
 	int error, flag = 0, flag2 = 0;
 	int hasmount;
+	int priv = 0;
 	struct vattr va;
 	struct nlookupdata nd;
 	char fstypename[MFSNAMELEN];
 	struct ucred *cred;
 
 	cred = td->td_ucred;
-	if (jailed(cred)) {
+
+	/* We do not allow user mounts inside a jail for now */
+	if (usermount && jailed(cred)) {
 		error = EPERM;
 		goto done;
 	}
-	if (usermount == 0 && (error = priv_check(td, PRIV_ROOT)))
+
+	/*
+	 * Extract the file system type. We need to know this early, to take
+	 * appropriate actions for jails and nullfs mounts.
+	 */
+        if ((error = copyinstr(uap->type, fstypename, MFSNAMELEN, NULL)) != 0)
+		goto done;
+
+	/*
+	 * Select the correct priv according to the file system type.
+	 */
+	priv = get_fspriv(fstypename);
+
+	if (usermount == 0 && (error = priv_check(td, priv)))
 		goto done;
 
 	/*
 	 * Do not allow NFS export by non-root users.
 	 */
 	if (uap->flags & MNT_EXPORTED) {
-		error = priv_check(td, PRIV_ROOT);
+		error = priv_check(td, priv);
 		if (error)
 			goto done;
 	}
 	/*
 	 * Silently enforce MNT_NOSUID and MNT_NODEV for non-root users
 	 */
-	if (priv_check(td, PRIV_ROOT)) 
+	if (priv_check(td, priv))
 		uap->flags |= MNT_NOSUID | MNT_NODEV;
 
 	/*
@@ -195,16 +212,6 @@ sys_mount(struct mount_args *uap)
 	cache_unlock(&nch);
 
 	/*
-	 * Extract the file system type. We need to know this early, to take
-	 * appropriate actions if we are dealing with a nullfs.
-	 */
-        if ((error = copyinstr(uap->type, fstypename, MFSNAMELEN, NULL)) != 0) {
-                cache_drop(&nch);
-                vput(vp);
-		goto done;
-        }
-
-	/*
 	 * Now we have an unlocked ref'd nch and a locked ref'd vp
 	 */
 	if (uap->flags & MNT_UPDATE) {
@@ -240,7 +247,7 @@ sys_mount(struct mount_args *uap)
 		 * permitted to update it.
 		 */
 		if (mp->mnt_stat.f_owner != cred->cr_uid &&
-		    (error = priv_check(td, PRIV_ROOT))) {
+		    (error = priv_check(td, priv))) {
 			cache_drop(&nch);
 			vput(vp);
 			goto done;
@@ -272,7 +279,7 @@ sys_mount(struct mount_args *uap)
 	 */
 	if ((error = VOP_GETATTR(vp, &va)) ||
 	    (va.va_uid != cred->cr_uid &&
-	     (error = priv_check(td, PRIV_ROOT)))) {
+	     (error = priv_check(td, priv)))) {
 		cache_drop(&nch);
 		vput(vp);
 		goto done;
@@ -335,9 +342,8 @@ sys_mount(struct mount_args *uap)
 	 * Allocate and initialize the filesystem.
 	 */
 	mp = kmalloc(sizeof(struct mount), M_MOUNT, M_ZERO|M_WAITOK);
-	mount_init(mp);
+	mount_init(mp, vfsp->vfc_vfsops);
 	vfs_busy(mp, LK_NOWAIT);
-	mp->mnt_op = vfsp->vfc_vfsops;
 	mp->mnt_vfc = vfsp;
 	mp->mnt_pbuf_count = nswbuf_kva / NSWBUF_SPLIT;
 	vfsp->vfc_refcount++;
@@ -378,7 +384,7 @@ update:
 	/*
 	 * Mount the filesystem.
 	 * XXX The final recipients of VFS_MOUNT just overwrite the ndp they
-	 * get. 
+	 * get.
 	 */
 	if (mp->mnt_flag & MNT_UPDATE) {
 		error = VFS_MOUNT(mp, uap->path, uap->data, cred);
@@ -445,6 +451,10 @@ update:
 		vfs_rm_vnodeops(mp, NULL, &mp->mnt_vn_norm_ops);
 		vfs_rm_vnodeops(mp, NULL, &mp->mnt_vn_spec_ops);
 		vfs_rm_vnodeops(mp, NULL, &mp->mnt_vn_fifo_ops);
+		if (mp->mnt_cred) {
+			crfree(mp->mnt_cred);
+			mp->mnt_cred = NULL;
+		}
 		mp->mnt_vfc->vfc_refcount--;
 		lwkt_reltoken(&mp->mnt_token);
 		vfs_unbusy(mp);
@@ -597,15 +607,20 @@ sys_unmount(struct unmount_args *uap)
 	struct proc *p __debugvar = td->td_proc;
 	struct mount *mp = NULL;
 	struct nlookupdata nd;
+	char fstypename[MFSNAMELEN];
+	int priv = 0;
 	int error;
+	struct ucred *cred;
+
+	cred = td->td_ucred;
 
 	KKASSERT(p);
-	if (td->td_ucred->cr_prison != NULL) {
+
+	/* We do not allow user umounts inside a jail for now */
+	if (usermount && jailed(cred)) {
 		error = EPERM;
 		goto done;
 	}
-	if (usermount == 0 && (error = priv_check(td, PRIV_ROOT)))
-		goto done;
 
 	error = nlookup_init(&nd, uap->path, UIO_USERSPACE,
 			     NLC_FOLLOW | NLC_IGNBADDIR);
@@ -616,12 +631,21 @@ sys_unmount(struct unmount_args *uap)
 
 	mp = nd.nl_nch.mount;
 
+	/* Figure out the fsname in order to select proper privs */
+	ksnprintf(fstypename, MFSNAMELEN, "%s", mp->mnt_vfc->vfc_name);
+	priv = get_fspriv(fstypename);
+
+	if (usermount == 0 && (error = priv_check(td, priv))) {
+		nlookup_done(&nd);
+		goto done;
+	}
+
 	/*
 	 * Only root, or the user that did the original mount is
 	 * permitted to unmount this filesystem.
 	 */
 	if ((mp->mnt_stat.f_owner != td->td_ucred->cr_uid) &&
-	    (error = priv_check(td, PRIV_ROOT)))
+	    (error = priv_check(td, priv)))
 		goto out;
 
 	/*
@@ -637,6 +661,15 @@ sys_unmount(struct unmount_args *uap)
 	 */
 	if (nd.nl_nch.ncp != mp->mnt_ncmountpt.ncp) {
 		error = EINVAL;
+		goto out;
+	}
+
+	/* Check if this mount belongs to this prison */
+	if (jailed(cred) && mp->mnt_cred && (!mp->mnt_cred->cr_prison ||
+		mp->mnt_cred->cr_prison != cred->cr_prison)) {
+		kprintf("mountpoint %s does not belong to this jail\n",
+		    uap->path);
+		error = EPERM;
 		goto out;
 	}
 
@@ -803,7 +836,7 @@ dounmount(struct mount *mp, int flags, int halting)
 		 */
 		cache_unmounting(mp);
 		if (mp->mnt_refs != 1)
-			cache_clearmntcache();
+			cache_clearmntcache(mp);
 
 		/*
 		 * Break out if we are good.  Don't count ncp refs if the
@@ -938,6 +971,11 @@ dounmount(struct mount *mp, int flags, int halting)
 		cache_drop(&nch);
 	}
 
+	if (mp->mnt_cred) {
+		crfree(mp->mnt_cred);
+		mp->mnt_cred = NULL;
+	}
+
 	mp->mnt_vfc->vfc_refcount--;
 
 	/*
@@ -968,18 +1006,18 @@ dounmount(struct mount *mp, int flags, int halting)
 	 */
 	if (freeok) {
 		if (mp->mnt_refs > 0)
-			cache_clearmntcache();
+			cache_clearmntcache(mp);
 		while (mp->mnt_refs > 0) {
 			cache_unmounting(mp);
 			wakeup(mp);
 			tsleep(&mp->mnt_refs, 0, "umntrwait", hz / 10 + 1);
-			cache_clearmntcache();
+			cache_clearmntcache(mp);
 		}
 		lwkt_reltoken(&mp->mnt_token);
 		mount_drop(mp);
 		mp = NULL;
 	} else {
-		cache_clearmntcache();
+		cache_clearmntcache(mp);
 	}
 	error = 0;
 	KNOTE(&fs_klist, VQ_UNMOUNT);
@@ -2058,16 +2096,20 @@ kern_open(struct nlookupdata *nd, int oflags, int mode, int *res)
 	 *
 	 * Request a shared lock on the vnode if possible.
 	 *
-	 * Executable binaries can race VTEXT against O_RDWR opens, so
-	 * use an exclusive lock for O_RDWR opens as well.
+	 * When NLC_SHAREDLOCK is set we may still need an exclusive vnode
+	 * lock for O_RDWR opens on executables in order to avoid a VTEXT
+	 * detection race.  The NLC_EXCLLOCK_IFEXEC handles this case.
 	 *
 	 * NOTE: We need a flag to separate terminal vnode locking from
 	 *	 parent locking.  O_CREAT needs parent locking, but O_TRUNC
 	 *	 and O_RDWR only need to lock the terminal vnode exclusively.
 	 */
 	nd->nl_flags |= NLC_LOCKVP;
-	if ((flags & (O_CREAT|O_TRUNC|O_RDWR)) == 0)
+	if ((flags & (O_CREAT|O_TRUNC)) == 0) {
 		nd->nl_flags |= NLC_SHAREDLOCK;
+		if (flags & O_RDWR)
+			nd->nl_flags |= NLC_EXCLLOCK_IFEXEC;
+	}
 
 	error = vn_open(nd, fp, flags, cmode);
 	nlookup_done(nd);
@@ -2261,6 +2303,8 @@ kern_mknod(struct nlookupdata *nd, int mode, int rmajor, int rminor)
 		return (error);
 	if (nd->nl_nch.ncp->nc_vp)
 		return (EEXIST);
+	if (nd->nl_dvp == NULL)
+		return (EINVAL);
 	if ((error = ncp_writechk(&nd->nl_nch)) != 0)
 		return (error);
 
@@ -2335,6 +2379,8 @@ kern_mkfifo(struct nlookupdata *nd, int mode)
 		return (error);
 	if (nd->nl_nch.ncp->nc_vp)
 		return (EEXIST);
+	if (nd->nl_dvp == NULL)
+		return (EINVAL);
 	if ((error = ncp_writechk(&nd->nl_nch)) != 0)
 		return (error);
 
@@ -2484,6 +2530,10 @@ kern_link(struct nlookupdata *nd, struct nlookupdata *linknd)
 		vrele(vp);
 		return (EEXIST);
 	}
+	if (linknd->nl_dvp == NULL) {
+		vrele(vp);
+		return (EINVAL);
+	}
 	VFS_MODIFYING(vp->v_mount);
 	error = vn_lock(vp, LK_EXCLUSIVE | LK_RETRY | LK_FAILRECLAIM);
 	if (error) {
@@ -2566,6 +2616,8 @@ kern_symlink(struct nlookupdata *nd, char *path, int mode)
 		return (error);
 	if (nd->nl_nch.ncp->nc_vp)
 		return (EEXIST);
+	if (nd->nl_dvp == NULL)
+		return (EINVAL);
 	if ((error = ncp_writechk(&nd->nl_nch)) != 0)
 		return (error);
 	dvp = nd->nl_dvp;
@@ -2652,6 +2704,8 @@ sys_undelete(struct undelete_args *uap)
 	nd.nl_flags |= NLC_DELETE | NLC_REFDVP;
 	if (error == 0)
 		error = nlookup(&nd);
+	if (error == 0 && nd.nl_dvp == NULL)
+		error = EINVAL;
 	if (error == 0)
 		error = ncp_writechk(&nd.nl_nch);
 	if (error == 0) {
@@ -2671,6 +2725,8 @@ kern_unlink(struct nlookupdata *nd)
 	nd->nl_flags |= NLC_DELETE | NLC_REFDVP;
 	if ((error = nlookup(nd)) != 0)
 		return (error);
+	if (nd->nl_dvp == NULL)
+		return EINVAL;
 	if ((error = ncp_writechk(&nd->nl_nch)) != 0)
 		return (error);
 	error = VOP_NREMOVE(&nd->nl_nch, nd->nl_dvp, nd->nl_cred);
@@ -2820,6 +2876,8 @@ kern_access(struct nlookupdata *nd, int amode, int flags)
 	nd->nl_flags |= NLC_SHAREDLOCK;
 	if ((error = nlookup(nd)) != 0)
 		return (error);
+	if ((amode & W_OK) && (error = ncp_writechk(&nd->nl_nch)) != 0)
+		return (error);
 retry:
 	error = cache_vget(&nd->nl_nch, nd->nl_cred, LK_SHARED, &vp);
 	if (error)
@@ -2835,8 +2893,9 @@ retry:
 		if (amode & X_OK)
 			mode |= VEXEC;
 		if ((mode & VWRITE) == 0 || 
-		    (error = vn_writechk(vp, &nd->nl_nch)) == 0)
+		    (error = vn_writechk(vp)) == 0) {
 			error = VOP_ACCESS_FLAGS(vp, mode, flags, nd->nl_cred);
+		}
 
 		/*
 		 * If the file handle is stale we have to re-resolve the
@@ -2931,7 +2990,12 @@ again:
 	if ((vp = nd->nl_nch.ncp->nc_vp) == NULL)
 		return (ENOENT);
 
-	if ((error = vget(vp, LK_SHARED)) != 0)
+#if 1
+	error = cache_vref(&nd->nl_nch, NULL, &vp);
+#else
+	error = vget(vp, LK_SHARED);
+#endif
+	if (error)
 		return (error);
 	error = vn_stat(vp, st, nd->nl_cred);
 
@@ -2941,7 +3005,11 @@ again:
 	 * at the moment.
 	 */
 	if (error == ESTALE) {
+#if 1
+		vrele(vp);
+#else
 		vput(vp);
+#endif
 		cache_unlock(&nd->nl_nch);
 		cache_lock(&nd->nl_nch);
 		cache_setunresolved(&nd->nl_nch);
@@ -2949,7 +3017,11 @@ again:
 		if (error == 0)
 			goto again;
 	} else {
+#if 1
+		vrele(vp);
+#else
 		vput(vp);
+#endif
 	}
 	return (error);
 }
@@ -3813,7 +3885,7 @@ kern_utimensat(struct nlookupdata *nd, const struct timespec *ts, int flags)
 		return (error);
 	if ((error = cache_vref(&nd->nl_nch, nd->nl_cred, &vp)) != 0)
 		return (error);
-	if ((error = vn_writechk(vp, &nd->nl_nch)) == 0) {
+	if ((error = vn_writechk(vp)) == 0) {
 		error = vget(vp, LK_EXCLUSIVE);
 		if (error == 0) {
 			error = setutimes(vp, &vattr, newts, nullflag);
@@ -3889,7 +3961,7 @@ kern_truncate(struct nlookupdata *nd, off_t length)
 		old_size = vattr.va_size;
 	}
 
-	if ((error = vn_writechk(vp, &nd->nl_nch)) == 0) {
+	if ((error = vn_writechk(vp)) == 0) {
 		VATTR_NULL(&vattr);
 		vattr.va_size = length;
 		error = VOP_SETATTR(vp, &vattr, nd->nl_cred);
@@ -3964,7 +4036,7 @@ kern_ftruncate(int fd, off_t length)
 		old_size = vattr.va_size;
 	}
 
-	if ((error = vn_writechk(vp, NULL)) == 0) {
+	if ((error = vn_writechk(vp)) == 0) {
 		VATTR_NULL(&vattr);
 		vattr.va_size = length;
 		error = VOP_SETATTR_FP(vp, &vattr, fp->f_cred, fp);
@@ -4307,6 +4379,8 @@ kern_mkdir(struct nlookupdata *nd, int mode)
 
 	if (nd->nl_nch.ncp->nc_vp)
 		return (EEXIST);
+	if (nd->nl_dvp == NULL)
+		return (EINVAL);
 	if ((error = ncp_writechk(&nd->nl_nch)) != 0)
 		return (error);
 	VATTR_NULL(&vattr);
@@ -4375,6 +4449,8 @@ kern_rmdir(struct nlookupdata *nd)
 	 */
 	if (nd->nl_nch.ncp->nc_flag & (NCF_ISMOUNTPT))
 		return (EBUSY);
+	if (nd->nl_dvp == NULL)
+		return (EINVAL);
 	if ((error = ncp_writechk(&nd->nl_nch)) != 0)
 		return (error);
 	error = VOP_NRMDIR(&nd->nl_nch, nd->nl_dvp, nd->nl_cred);
@@ -4670,7 +4746,7 @@ sys_fhopen(struct fhopen_args *uap)
 			error = EISDIR;
 			goto bad;
 		}
-		error = vn_writechk(vp, NULL);
+		error = vn_writechk(vp);
 		if (error)
 			goto bad;
 		mode |= VWRITE;
@@ -5160,3 +5236,83 @@ chroot_visible_mnt(struct mount *mp, struct proc *p)
 	return(0);
 }
 
+/* Sets priv to PRIV_ROOT in case no matching fs */
+static int
+get_fspriv(const char *fsname)
+{
+
+	if (strncmp("null", fsname, 5) == 0) {
+		return PRIV_VFS_MOUNT_NULLFS;
+	} else if (strncmp(fsname, "tmpfs", 6) == 0) {
+		return PRIV_VFS_MOUNT_TMPFS;
+	}
+
+	return PRIV_ROOT;
+}
+
+int
+sys___realpath(struct __realpath_args *uap)
+{
+	struct nlookupdata nd;
+	char *rbuf;
+	char *fbuf;
+	ssize_t rlen;
+	int error;
+
+	/*
+	 * Invalid length if less than 0.  0 is allowed
+	 */
+	if ((ssize_t)uap->len < 0)
+		return EINVAL;
+
+	rbuf = NULL;
+	fbuf = NULL;
+	error = nlookup_init(&nd, uap->path, UIO_USERSPACE, NLC_FOLLOW);
+	if (error)
+		goto done;
+
+	nd.nl_flags |= NLC_SHAREDLOCK;
+	error = nlookup(&nd);
+	if (error)
+		goto done;
+
+	if (nd.nl_nch.ncp->nc_vp == NULL) {
+		error = ENOENT;
+		goto done;
+	}
+
+	/*
+	 * Shortcut test for existence.
+	 */
+	if (uap->len == 0) {
+		error = ENAMETOOLONG;
+		goto done;
+	}
+
+	/*
+	 * Obtain the path relative to the process root.  The nch must not
+	 * be locked for the cache_fullpath() call.
+	 */
+	if (nd.nl_flags & NLC_NCPISLOCKED) {
+		nd.nl_flags &= ~NLC_NCPISLOCKED;
+		cache_unlock(&nd.nl_nch);
+	}
+	error = cache_fullpath(curproc, &nd.nl_nch, NULL, &rbuf, &fbuf, 0);
+	if (error)
+		goto done;
+
+	rlen = (ssize_t)strlen(rbuf);
+	if (rlen >= uap->len) {
+		error = ENAMETOOLONG;
+		goto done;
+	}
+	error = copyout(rbuf, uap->buf, rlen + 1);
+	if (error == 0)
+		uap->sysmsg_szresult = rlen;
+done:
+	nlookup_done(&nd);
+	if (fbuf)
+		kfree(fbuf, M_TEMP);
+
+	return error;
+}

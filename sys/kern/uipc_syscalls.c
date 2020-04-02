@@ -57,6 +57,7 @@
 #include <sys/vnode.h>
 #include <sys/lock.h>
 #include <sys/mount.h>
+#include <sys/jail.h>
 #ifdef KTRACE
 #include <sys/ktrace.h>
 #endif
@@ -175,6 +176,10 @@ sys_bind(struct bind_args *uap)
 	error = getsockaddr(&sa, uap->name, uap->namelen);
 	if (error)
 		return (error);
+	if (!prison_remote_ip(curthread, sa)) {
+		kfree(sa, M_SONAME);
+		return EAFNOSUPPORT;
+	}
 	error = kern_bind(uap->s, sa);
 	kfree(sa, M_SONAME);
 
@@ -440,11 +445,13 @@ sys_accept(struct accept_args *uap)
 		error = kern_accept(uap->s, 0, &sa, &sa_len,
 				    &uap->sysmsg_iresult, 0);
 
-		if (error == 0)
+		if (error == 0) {
+			prison_local_ip(curthread, sa);
 			error = copyout(sa, uap->name, sa_len);
+		}
 		if (error == 0) {
 			error = copyout(&sa_len, uap->anamelen,
-			    sizeof(*uap->anamelen));
+					sizeof(*uap->anamelen));
 		}
 		if (sa)
 			kfree(sa, M_SONAME);
@@ -476,8 +483,10 @@ sys_extaccept(struct extaccept_args *uap)
 		error = kern_accept(uap->s, fflags, &sa, &sa_len,
 				    &uap->sysmsg_iresult, 0);
 
-		if (error == 0)
+		if (error == 0) {
+			prison_local_ip(curthread, sa);
 			error = copyout(sa, uap->name, sa_len);
+		}
 		if (error == 0) {
 			error = copyout(&sa_len, uap->anamelen,
 			    sizeof(*uap->anamelen));
@@ -516,11 +525,13 @@ sys_accept4(struct accept4_args *uap)
 		error = kern_accept(uap->s, 0, &sa, &sa_len,
 				    &uap->sysmsg_iresult, sockflags);
 
-		if (error == 0)
+		if (error == 0) {
+			prison_local_ip(curthread, sa);
 			error = copyout(sa, uap->name, sa_len);
+		}
 		if (error == 0) {
 			error = copyout(&sa_len, uap->anamelen,
-			    sizeof(*uap->anamelen));
+					sizeof(*uap->anamelen));
 		}
 		if (sa)
 			kfree(sa, M_SONAME);
@@ -622,6 +633,10 @@ sys_connect(struct connect_args *uap)
 	error = getsockaddr(&sa, uap->name, uap->namelen);
 	if (error)
 		return (error);
+	if (!prison_remote_ip(curthread, sa)) {
+		kfree(sa, M_SONAME);
+		return EAFNOSUPPORT;
+	}
 	error = kern_connect(uap->s, 0, sa);
 	kfree(sa, M_SONAME);
 
@@ -643,6 +658,10 @@ sys_extconnect(struct extconnect_args *uap)
 	error = getsockaddr(&sa, uap->name, uap->namelen);
 	if (error)
 		return (error);
+	if (!prison_remote_ip(curthread, sa)) {
+		kfree(sa, M_SONAME);
+		return EAFNOSUPPORT;
+	}
 	error = kern_connect(uap->s, fflags, sa);
 	kfree(sa, M_SONAME);
 
@@ -822,6 +841,10 @@ sys_sendto(struct sendto_args *uap)
 		error = getsockaddr(&sa, uap->to, uap->tolen);
 		if (error)
 			return (error);
+		if (!prison_remote_ip(curthread, sa)) {
+			kfree(sa, M_SONAME);
+			return EAFNOSUPPORT;
+		}
 	}
 	aiov.iov_base = uap->buf;
 	aiov.iov_len = uap->len;
@@ -868,6 +891,10 @@ sys_sendmsg(struct sendmsg_args *uap)
 		error = getsockaddr(&sa, msg.msg_name, msg.msg_namelen);
 		if (error)
 			return (error);
+		if (!prison_remote_ip(curthread, sa)) {
+			kfree(sa, M_SONAME);
+			return EAFNOSUPPORT;
+		}
 	}
 
 	/*
@@ -1028,6 +1055,7 @@ sys_recvfrom(struct recvfrom_args *uap)
 		/* note: sa may still be NULL */
 		if (sa) {
 			fromlen = MIN(fromlen, sa->sa_len);
+			prison_local_ip(curthread, sa);
 			error = copyout(sa, uap->from, fromlen);
 		} else {
 			fromlen = 0;
@@ -1108,6 +1136,7 @@ sys_recvmsg(struct recvmsg_args *uap)
 		/* note: sa may still be NULL */
 		if (sa != NULL) {
 			fromlen = MIN(msg.msg_namelen, sa->sa_len);
+			prison_local_ip(curthread, sa);
 			error = copyout(sa, msg.msg_name, fromlen);
 		} else {
 			fromlen = 0;
@@ -1369,6 +1398,7 @@ sys_getsockname(struct getsockname_args *uap)
 
 	if (error == 0) {
 		if (sa) {
+			prison_local_ip(curthread, sa);
 			error = copyout(sa, uap->asa, sa_len_out);
 		} else {
 			/*
@@ -1453,8 +1483,10 @@ sys_getpeername(struct getpeername_args *uap)
 
 	error = kern_getpeername(uap->fdes, &sa, &sa_len);
 
-	if (error == 0)
+	if (error == 0) {
+		prison_local_ip(curthread, sa);
 		error = copyout(sa, uap->asa, sa_len);
+	}
 	if (error == 0)
 		error = copyout(&sa_len, uap->alen, sizeof(*uap->alen));
 	if (sa)
@@ -1478,14 +1510,6 @@ getsockaddr(struct sockaddr **namp, caddr_t uaddr, size_t len)
 	if (error) {
 		kfree(sa, M_SONAME);
 	} else {
-#if BYTE_ORDER != BIG_ENDIAN
-		/*
-		 * The bind(), connect(), and sendto() syscalls were not
-		 * versioned for COMPAT_43.  Thus, this check must stay.
-		 */
-		if (sa->sa_family == 0 && sa->sa_len < AF_MAX)
-			sa->sa_family = sa->sa_len;
-#endif
 		sa->sa_len = len;
 		*namp = sa;
 	}

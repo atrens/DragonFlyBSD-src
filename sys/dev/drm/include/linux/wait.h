@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2014 Imre Vadász
- * Copyright (c) 2014-2019 François Tigeot <ftigeot@wolfpond.org>
+ * Copyright (c) 2014-2020 François Tigeot <ftigeot@wolfpond.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -79,10 +79,16 @@ wake_up_all(wait_queue_head_t *q)
 	wakeup(q);
 }
 
+void wake_up_bit(void *, int);
+
 #define wake_up_all_locked(eq)		__wake_up_core(eq, 0)
 
 #define wake_up_interruptible(eq)	wake_up(eq)
 #define wake_up_interruptible_all(eq)	wake_up_all(eq)
+
+void __wait_event_prefix(wait_queue_head_t *wq, int flags);
+void prepare_to_wait(wait_queue_head_t *q, wait_queue_t *wait, int state);
+void finish_wait(wait_queue_head_t *q, wait_queue_t *wait);
 
 /*
  * wait_event_interruptible_timeout:
@@ -105,17 +111,13 @@ wake_up_all(wait_queue_head_t *q)
 	bool timeout_expired = false;					\
 	bool interrupted = false;					\
 	long retval;							\
+	wait_queue_t tmp_wq;						\
 									\
 	start_jiffies = ticks;						\
+	INIT_LIST_HEAD(&tmp_wq.task_list);				\
 									\
 	while (1) {							\
-		lockmgr(&wq.lock, LK_EXCLUSIVE);			\
-		if (flags == PCATCH) {					\
-			set_current_state(TASK_INTERRUPTIBLE);		\
-		} else {						\
-			set_current_state(TASK_UNINTERRUPTIBLE);	\
-		}							\
-		lockmgr(&wq.lock, LK_RELEASE);				\
+		__wait_event_prefix(&wq, flags);			\
 									\
 		if (condition)						\
 			break;						\
@@ -145,7 +147,7 @@ wake_up_all(wait_queue_head_t *q)
 	else								\
 		retval = 1;						\
 									\
-	set_current_state(TASK_RUNNING);				\
+	finish_wait(&wq, &tmp_wq);					\
 	retval;								\
 })
 
@@ -188,27 +190,21 @@ waitqueue_active(wait_queue_head_t *q)
 	wait_queue_t name = {					\
 		.private = current,				\
 		.task_list = LIST_HEAD_INIT((name).task_list),	\
+		.func = autoremove_wake_function,		\
 	}
-
-static inline void
-prepare_to_wait(wait_queue_head_t *q, wait_queue_t *wait, int state)
-{
-}
-
-static inline void
-finish_wait(wait_queue_head_t *q, wait_queue_t *wait)
-{
-}
-
-static inline void
-add_wait_queue(wait_queue_head_t *q, wait_queue_t *wait)
-{
-}
 
 static inline void
 __add_wait_queue(wait_queue_head_t *head, wait_queue_t *new)
 {
 	list_add(&new->task_list, &head->task_list);
+}
+
+static inline void
+add_wait_queue(wait_queue_head_t *head, wait_queue_t *wq)
+{
+	lockmgr(&head->lock, LK_EXCLUSIVE);
+	__add_wait_queue(head, wq);
+	lockmgr(&head->lock, LK_RELEASE);
 }
 
 #define DECLARE_WAIT_QUEUE_HEAD(name)					\
@@ -222,5 +218,22 @@ __remove_wait_queue(wait_queue_head_t *head, wait_queue_t *old)
 {
 	list_del(&old->task_list);
 }
+
+static inline void
+remove_wait_queue(wait_queue_head_t *head, wait_queue_t *wq)
+{
+	lockmgr(&head->lock, LK_EXCLUSIVE);
+	__remove_wait_queue(head, wq);
+	lockmgr(&head->lock, LK_RELEASE);
+}
+
+static inline void
+__add_wait_queue_tail(wait_queue_head_t *wqh, wait_queue_t *wq)
+{
+	list_add_tail(&wq->task_list, &wqh->task_list);
+}
+
+int wait_on_bit_timeout(unsigned long *word, int bit,
+			unsigned mode, unsigned long timeout);
 
 #endif	/* _LINUX_WAIT_H_ */

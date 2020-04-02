@@ -206,13 +206,11 @@ nullfs_mount(struct mount *mp, char *path, caddr_t data, struct ucred *cred)
 	 *
 	 * All NULLFS operations are MPSAFE, though it will be short-lived
 	 * if the underlying filesystem is not.
+	 *
+	 * NOTE: There is no syncer thread for nullfs (flagged in vfsops)
 	 */
 	mp->mnt_kern_flag |= MNTK_NCALIASED | MNTK_ALL_MPSAFE;
 
-	/*
-	 * And we don't need a syncer thread
-	 */
-	vn_syncer_thr_stop(mp);
 	return (0);
 fail2:
 	nlookup_done(&nd);
@@ -394,8 +392,23 @@ nullfs_ncpgen_test(struct mount *mp, struct namecache *ncp)
 	return VFS_NCPGEN_TEST(xmp->nullm_vfs, ncp);
 }
 
+static int
+nullfs_modifying(struct mount *mp)
+{
+	struct null_mount *xmp = MOUNTTONULLMOUNT(mp);
+	int error;
+
+	if (mp->mnt_flag & MNT_RDONLY)
+		error = EROFS;
+	else if (xmp->nullm_vfs)
+		error = VFS_MODIFYING(xmp->nullm_vfs);
+	else
+		error = 0;
+	return error;
+}
 
 static struct vfsops null_vfsops = {
+	.vfs_flags =		VFSOPSF_NOSYNCERTHR,
 	.vfs_mount =   	 	nullfs_mount,
 	.vfs_unmount =   	nullfs_unmount,
 	.vfs_root =     	nullfs_root,
@@ -406,7 +419,8 @@ static struct vfsops null_vfsops = {
 	.vfs_vptofh =		nullfs_vptofh,
 	.vfs_ncpgen_set =	nullfs_ncpgen_set,
 	.vfs_ncpgen_test =	nullfs_ncpgen_test,
-	.vfs_checkexp =  	nullfs_checkexp
+	.vfs_checkexp =  	nullfs_checkexp,
+	.vfs_modifying =	nullfs_modifying
 };
 
 VFS_SET(null_vfsops, null, VFCF_LOOPBACK | VFCF_MPSAFE);

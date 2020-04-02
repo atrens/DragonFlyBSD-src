@@ -182,10 +182,14 @@ struct vm_page {
 	TAILQ_ENTRY(vm_page) pageq;	/* vm_page_queues[] list 	*/
 	RB_ENTRY(vm_page) rb_entry;	/* Red-Black tree based at object */
 	struct spinlock	spin;
+	struct md_page md;		/* machine dependant stuff */
+	uint32_t wire_count;		/* wired down maps refs (P) */
+	uint32_t busy_count;		/* soft-busy and hard-busy */
+	int 	hold_count;		/* page hold count */
+	int	ku_pagecnt;		/* help kmalloc() w/oversized allocs */
 	struct vm_object *object;	/* which object am I in */
 	vm_pindex_t pindex;		/* offset into object */
 	vm_paddr_t phys_addr;		/* physical address of page */
-	struct md_page md;		/* machine dependant stuff */
 	uint16_t queue;			/* page queue index */
 	uint16_t pc;			/* page color */
 	uint8_t	act_count;		/* page usage count */
@@ -193,10 +197,6 @@ struct vm_page {
 	uint8_t	valid;			/* map of valid DEV_BSIZE chunks */
 	uint8_t	dirty;			/* map of dirty DEV_BSIZE chunks */
 	uint32_t flags;			/* see below */
-	uint32_t wire_count;		/* wired down maps refs (P) */
-	uint32_t busy_count;		/* soft-busy and hard-busy */
-	int 	hold_count;		/* page hold count */
-	int	ku_pagecnt;		/* help kmalloc() w/oversized allocs */
 	int	unused01;		/* available */
 	/* 128 bytes */
 #ifdef VM_PAGE_DEBUG
@@ -318,6 +318,9 @@ extern struct vpgqueues vm_page_queues[PQ_COUNT];
  *		     via a page fault (aka pmap_enter()), but must be cleared
  *		     manually.
  *
+ * PG_MAPPEDMULTI  - Possibly mapped to multiple pmaps or to multiple locations
+ *		     ine one pmap.
+ *
  * PG_WRITEABLE    - Indicates that the page MIGHT be writeable via a pte.
  *		     If not set, guarantees that the page is not writeable.
  *
@@ -371,7 +374,7 @@ extern struct vpgqueues vm_page_queues[PQ_COUNT];
 #define	PG_FICTITIOUS	0x00000008	/* No reverse-map or tracking */
 #define	PG_WRITEABLE	0x00000010	/* page may be writeable */
 #define PG_MAPPED	0x00000020	/* page may be mapped (managed) */
-#define	PG_UNUSED0040	0x00000040
+#define	PG_MAPPEDMULTI	0x00000040	/* multiple mappings */
 #define PG_REFERENCED	0x00000080	/* page has been referenced */
 #define PG_CLEANCHK	0x00000100	/* page will be checked for cleaning */
 #define PG_UNUSED0200	0x00000200

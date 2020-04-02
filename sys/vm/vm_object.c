@@ -379,12 +379,13 @@ VMOBJDEBUG(vm_object_drop)(vm_object_t obj VMOBJDBARGS)
  * No requirements.
  */
 void
-_vm_object_allocate(objtype_t type, vm_pindex_t size, vm_object_t object)
+_vm_object_allocate(objtype_t type, vm_pindex_t size, vm_object_t object,
+		    const char *ident)
 {
 	struct vm_object_hash *hash;
 
 	RB_INIT(&object->rb_memq);
-	lwkt_token_init(&object->token, "vmobj");
+	lwkt_token_init(&object->token, ident);
 
 	TAILQ_INIT(&object->backing_list);
 	lockinit(&object->backing_lk, "baclk", 0, 0);
@@ -423,7 +424,7 @@ _vm_object_allocate(objtype_t type, vm_pindex_t size, vm_object_t object)
 void
 vm_object_init(vm_object_t object, vm_pindex_t size)
 {
-	_vm_object_allocate(OBJT_DEFAULT, size, object);
+	_vm_object_allocate(OBJT_DEFAULT, size, object, "vmobj");
 	vm_object_drop(object);
 }
 
@@ -444,7 +445,7 @@ vm_object_init1(void)
 	}
 
 	_vm_object_allocate(OBJT_DEFAULT, OFF_TO_IDX(KvaEnd),
-			    &kernel_object);
+			    &kernel_object, "kobj");
 	vm_object_drop(&kernel_object);
 }
 
@@ -465,7 +466,7 @@ vm_object_allocate(objtype_t type, vm_pindex_t size)
 	vm_object_t obj;
 
 	obj = kmalloc(sizeof(*obj), M_VM_OBJECT, M_INTWAIT|M_ZERO);
-	_vm_object_allocate(type, size, obj);
+	_vm_object_allocate(type, size, obj, "vmobj");
 	vm_object_drop(obj);
 
 	return (obj);
@@ -481,7 +482,7 @@ vm_object_allocate_hold(objtype_t type, vm_pindex_t size)
 	vm_object_t obj;
 
 	obj = kmalloc(sizeof(*obj), M_VM_OBJECT, M_INTWAIT|M_ZERO);
-	_vm_object_allocate(type, size, obj);
+	_vm_object_allocate(type, size, obj, "vmobj");
 
 	return (obj);
 }
@@ -541,6 +542,7 @@ VMOBJDEBUG(vm_object_vndeallocate)(vm_object_t object, struct vnode **vpp
 				   VMOBJDBARGS)
 {
 	struct vnode *vp = (struct vnode *) object->handle;
+	int count;
 
 	KASSERT(object->type == OBJT_VNODE,
 	    ("vm_object_vndeallocate: not a vnode object"));
@@ -552,21 +554,22 @@ VMOBJDEBUG(vm_object_vndeallocate)(vm_object_t object, struct vnode **vpp
 		panic("vm_object_vndeallocate: bad object reference count");
 	}
 #endif
+	count = object->ref_count;
+	cpu_ccfence();
 	for (;;) {
-		int count = object->ref_count;
-		cpu_ccfence();
 		if (count == 1) {
 			vm_object_upgrade(object);
-			if (atomic_cmpset_int(&object->ref_count, count, 0)) {
+			if (atomic_fcmpset_int(&object->ref_count, &count, 0)) {
 				vclrflags(vp, VTEXT);
 				break;
 			}
 		} else {
-			if (atomic_cmpset_int(&object->ref_count,
-					      count, count - 1)) {
+			if (atomic_fcmpset_int(&object->ref_count,
+					       &count, count - 1)) {
 				break;
 			}
 		}
+		cpu_pause();
 		/* retry */
 	}
 #if defined(DEBUG_LOCKS)
@@ -610,10 +613,9 @@ VMOBJDEBUG(vm_object_deallocate)(vm_object_t object VMOBJDBARGS)
 	if (object == NULL)
 		return;
 
+	count = object->ref_count;
+	cpu_ccfence();
 	for (;;) {
-		count = object->ref_count;
-		cpu_ccfence();
-
 		/*
 		 * If decrementing the count enters into special handling
 		 * territory (0, 1, or 2) we have to do it the hard way.
@@ -641,8 +643,8 @@ VMOBJDEBUG(vm_object_deallocate)(vm_object_t object VMOBJDBARGS)
 		 */
 		if (object->type == OBJT_VNODE) {
 			vp = (struct vnode *)object->handle;
-			if (atomic_cmpset_int(&object->ref_count,
-					      count, count - 1)) {
+			if (atomic_fcmpset_int(&object->ref_count,
+					       &count, count - 1)) {
 #if defined(DEBUG_LOCKS)
 				debugvm_object_add(object, file, line, -1);
 #endif
@@ -652,8 +654,8 @@ VMOBJDEBUG(vm_object_deallocate)(vm_object_t object VMOBJDBARGS)
 			}
 			/* retry */
 		} else {
-			if (atomic_cmpset_int(&object->ref_count,
-					      count, count - 1)) {
+			if (atomic_fcmpset_int(&object->ref_count,
+					       &count, count - 1)) {
 #if defined(DEBUG_LOCKS)
 				debugvm_object_add(object, file, line, -1);
 #endif
@@ -661,6 +663,7 @@ VMOBJDEBUG(vm_object_deallocate)(vm_object_t object VMOBJDBARGS)
 			}
 			/* retry */
 		}
+		cpu_pause();
 		/* retry */
 	}
 }
@@ -854,6 +857,15 @@ vm_object_terminate(vm_object_t object)
 
 /*
  * The caller must hold the object.
+ *
+ * NOTE: In PMAP_ADVANCED mode it is possible for vm_page's to remain flagged
+ *	 PG_MAPPED or PG_MAPPED|PG_WRITEABLE, even after pmap_mapped_sync()
+ *	 is called, due to normal pmap operations.  This is because only
+ *	 global pmap operations on the vm_page can clear the bits and not
+ *	 just local operations on individual pmaps.
+ *
+ *	 Most interactions that necessitate the clearing of these bits
+ *	 proactively call vm_page_protect(), and we must do so here as well.
  */
 static int
 vm_object_terminate_callback(vm_page_t p, void *data)
@@ -878,6 +890,8 @@ vm_object_terminate_callback(vm_page_t p, void *data)
 		/*
 		 * NOTE: p->dirty and PG_NEED_COMMIT are ignored.
 		 */
+		if (pmap_mapped_sync(p) & (PG_MAPPED | PG_WRITEABLE))
+			vm_page_protect(p, VM_PROT_NONE);
 		vm_page_free(p);
 		mycpu->gd_cnt.v_pfree++;
 	} else {
@@ -889,6 +903,8 @@ vm_object_terminate_callback(vm_page_t p, void *data)
 				print_backtrace(10);
 			}
 		}
+		if (pmap_mapped_sync(p) & (PG_MAPPED | PG_WRITEABLE))
+			vm_page_protect(p, VM_PROT_NONE);
 		vm_page_remove(p);
 		vm_page_wakeup(p);
 	}

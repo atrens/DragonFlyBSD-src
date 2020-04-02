@@ -64,14 +64,24 @@ typedef	__uint64_t	u_quad_t;	/* quads */
 typedef	__int64_t	quad_t;
 typedef	quad_t *	qaddr_t;
 
+#ifndef _BLKCNT_T_DECLARED
 typedef	__int64_t	blkcnt_t;	/* file block count */
+#define	_BLKCNT_T_DECLARED
+#endif
+#ifndef _BLKSIZE_T_DECLARED
 typedef	__int64_t	blksize_t;	/* block size */
+#define	_BLKSIZE_T_DECLARED
+#endif
 typedef	char *		caddr_t;	/* core address */
 typedef	const char *	c_caddr_t;	/* core address, pointer to const */
 typedef	volatile char *	v_caddr_t;	/* core address, pointer to volatile */
 typedef	__int32_t	daddr_t;	/* disk address */
 typedef	__uint32_t	u_daddr_t;	/* unsigned disk address */
 typedef	__uint32_t	fixpt_t;	/* fixed point number */
+#ifndef _DEV_T_DECLARED
+typedef	__uint32_t	dev_t;		/* device number */
+#define	_DEV_T_DECLARED
+#endif
 #ifndef _FSBLKCNT_T_DECLARED
 typedef	__uint64_t	fsblkcnt_t;	/* filesystem block count */
 #define	_FSBLKCNT_T_DECLARED
@@ -96,7 +106,10 @@ typedef	__uint32_t	in_addr_t;	/* base type for internet address */
 typedef	__uint16_t	in_port_t;
 #define	_IN_PORT_T_DECLARED
 #endif
+#ifndef _INO_T_DECLARED
 typedef	__uint64_t	ino_t;		/* inode number */
+#define	_INO_T_DECLARED
+#endif
 #ifndef _KEY_T_DECLARED
 typedef	long		key_t;		/* IPC key (for Sys V IPC) */
 #define	_KEY_T_DECLARED
@@ -105,7 +118,10 @@ typedef	long		key_t;		/* IPC key (for Sys V IPC) */
 typedef	__uint16_t	mode_t;		/* permissions */
 #define	_MODE_T_DECLARED
 #endif
+#ifndef _NLINK_T_DECLARED
 typedef	__uint32_t	nlink_t;	/* link count */
+#define	_NLINK_T_DECLARED
+#endif
 #ifndef _OFF_T_DECLARED
 typedef	__off_t		off_t;		/* file offset */
 #define	_OFF_T_DECLARED
@@ -116,12 +132,10 @@ typedef	__pid_t		pid_t;		/* process id */
 #endif
 #if __BSD_VISIBLE
 typedef	__register_t	register_t;	/* register-sized type */
-#endif
 #ifndef _RLIM_T_DECLARED
 typedef	__rlim_t	rlim_t;		/* resource limit */
 #define	_RLIM_T_DECLARED
 #endif
-#if __BSD_VISIBLE
 typedef	__intlp_t	segsz_t;	/* segment size */
 #endif
 #ifndef _SUSECONDS_T_DECLARED
@@ -135,25 +149,16 @@ typedef	__uint32_t	uid_t;		/* user id */
 typedef	__uint32_t	useconds_t;	/* microseconds (unsigned) */
 
 /*
- * The kernel now uses only udev_t or cdev_t.  Userland uses dev_t.
+ * The kernel uses dev_t or cdev_t.  Userland uses dev_t.
  * Virtual kernel builds needs dev_t in order to include userland headers.
  */
 #if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
 struct cdev;
 typedef	struct cdev	*cdev_t;
-typedef	u_int32_t	udev_t;		/* device number */
 typedef	u_int64_t	uoff_t;		/* uio offset */
-#endif /* _KERNEL) || _KERNEL_STRUCTURES */
+#endif /* _KERNEL || _KERNEL_STRUCTURES */
 
-#ifdef _KERNEL
-typedef	udev_t		dev_t;		/* device number */
-#endif /* _KERNEL */
-
-#ifndef _KERNEL
-typedef	u_int32_t	dev_t;		/* device number */
-#define	udev_t dev_t
-
-#if __BSD_VISIBLE
+#if __BSD_VISIBLE && !defined(_KERNEL)
 /*
  * minor() gives a cookie instead of an index since we don't want to
  * change the meanings of bits 0-15 or waste time and space shifting
@@ -162,8 +167,7 @@ typedef	u_int32_t	dev_t;		/* device number */
 #define	major(x)	((int)(((u_int)(x) >> 8)&0xff)) /* major number */
 #define	minor(x)	((int)((x)&0xffff00ff))         /* minor number */
 #define	makedev(x,y)	((dev_t)(((x) << 8) | (y)))     /* create dev_t */
-#endif /* __BSD_VISIBLE */
-#endif /* !_KERNEL */
+#endif /* __BSD_VISIBLE && !_KERNEL */
 
 #ifndef _CLOCK_T_DECLARED
 #define	_CLOCK_T_DECLARED

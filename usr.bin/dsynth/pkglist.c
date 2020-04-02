@@ -40,10 +40,12 @@
 #define PKG_HSIZE	32768
 #define PKG_HMASK	32767
 
+static int parsepkglist_file(const char *path, int debugstop);
 static void childGetPackageInfo(bulk_t *bulk);
 static void childGetBinaryDistInfo(bulk_t *bulk);
 static void childOptimizeEnv(bulk_t *bulk);
 static pkg_t *resolveDeps(pkg_t *dep_list, pkg_t ***list_tailp, int gentopo);
+static void resolveFlavors(pkg_t *pkg, char *flavors, int gentopo);
 static void resolveDepString(pkg_t *pkg, char *depstr,
 			int gentopo, int dep_type);
 static pkg_t *processPackageListBulk(int total);
@@ -52,6 +54,8 @@ static int scan_binary_repo(const char *path);
 #if 0
 static void pkgfree(pkg_t *pkg);
 #endif
+
+static int PrepareSystemFlag;
 
 pkg_t *PkgHash1[PKG_HSIZE];	/* by portdir */
 pkg_t *PkgHash2[PKG_HSIZE];	/* by pkgfile */
@@ -101,7 +105,10 @@ pkg_enter(pkg_t *pkg)
 				break;
 			pkgp = &scan->hnext1;
 		}
+		ddassert(scan == NULL || (scan->flags & PKGF_PLACEHOLD));
 		if (scan && (scan->flags & PKGF_PLACEHOLD)) {
+			ddassert(scan->idepon_list.next == &scan->idepon_list);
+			ddassert(scan->deponi_list.next == &scan->deponi_list);
 			*pkgp = pkg;
 			pkg->hnext1 = scan->hnext1;
 			free(scan->portdir);
@@ -147,41 +154,105 @@ pkg_find(const char *match)
  * Parse a specific list of ports via origin name (portdir/subdir)
  */
 pkg_t *
-ParsePackageList(int n, char **ary)
+ParsePackageList(int n, char **ary, int debugstop)
 {
 	pkg_t *list;
-	int i;
 	int total;
+	int fail;
+	int i;
 
 	total = 0;
+	fail = 0;
 	initbulk(childGetPackageInfo, MaxBulk);
 
 	/*
-	 * Always include ports-mgmt/pkg.  A non-null s4 field just tells
-	 * the processing code that this isn't a manual selection.
+	 * Always include ports-mgmt/pkg.  s4 is "x" meaning not a manual
+	 * selection, "d" meaning DEBUGSTOP mode, or NULL.
 	 */
 	queuebulk("ports-mgmt", "pkg", NULL, "x");
 
 	for (i = 0; i < n; ++i) {
 		char *l1;
 		char *l2;
+		char *l3;
+		struct stat st;
 
 		l1 = strdup(ary[i]);
-		l2 = strchr(l1, '/');
-		if (l2) {
-			*l2++ = 0;
-			queuebulk(l1, l2, NULL, NULL);
-			++total;
-		} else {
-			printf("Bad portdir specification: %s\n", l1);
+		if (stat(l1, &st) == 0 && S_ISREG(st.st_mode)) {
+			total += parsepkglist_file(l1, debugstop);
+			continue;
 		}
+
+		l2 = strchr(l1, '/');
+		if (l2 == NULL) {
+			printf("Bad portdir specification: %s\n", l1);
+			free(l1);
+			fail = 1;
+			continue;
+		}
+		*l2++ = 0;
+		l3 = strchr(l2, '@');
+		if (l3)
+			*l3++ = 0;
+		queuebulk(l1, l2, l3, (debugstop ? "d" : NULL));
+		++total;
 		free(l1);
 	}
 	printf("Processing %d ports\n", total);
 
 	list = processPackageListBulk(total);
+	if (fail) {
+		dfatal("Bad specifications, exiting");
+		exit(1);
+	}
 
 	return list;
+}
+
+static
+int
+parsepkglist_file(const char *path, int debugstop)
+{
+	FILE *fp;
+	char *base;
+	char *l1;
+	char *l2;
+	char *l3;
+	size_t len;
+	int total;
+
+	if ((fp = fopen(path, "r")) == NULL) {
+		dpanic_errno("Cannot read %s\n", path);
+		/* NOT REACHED */
+		return 0;
+	}
+
+	total = 0;
+
+	while ((base = fgetln(fp, &len)) != NULL) {
+		if (len == 0 || base[len-1] != '\n')
+			continue;
+		base[--len] = 0;
+		l1 = strtok(base, " \t\r\n");
+		if (l1 == NULL) {
+			printf("Badly formatted pkg info line: %s\n", base);
+			continue;
+		}
+		l2 = strchr(l1, '/');
+		if (l2 == NULL) {
+			printf("Badly formatted specification: %s\n", l1);
+			continue;
+		}
+		*l2++ = 0;
+		l3 = strchr(l2, '@');
+		if (l3)
+			*l3++ = 0;
+		queuebulk(l1, l2, l3, (debugstop ? "d" : NULL));
+		++total;
+	}
+	fclose(fp);
+
+	return total;
 }
 
 /*
@@ -193,19 +264,27 @@ GetLocalPackageList(void)
 	pkg_t *list;
 	FILE *fp;
 	char *base;
+	char *data;
 	char *l1;
 	char *l2;
+	char *l3;
 	int total;
+	int state;
 	size_t len;
 
+	PrepareSystemFlag = 1;
 	initbulk(childGetPackageInfo, MaxBulk);
 	total = 0;
+	state = 0;
+	l1 = NULL;
+	l2 = NULL;
+	l3 = NULL;
 
-	fp = popen("pkg info -a -o", "r");
+	fp = popen("pkg info -a -o -A", "r");
 
 	/*
-	 * Always include ports-mgmt/pkg.  A non-null s4 field just tells
-	 * the processing code that this isn't a manual selection.
+	 * Always include ports-mgmt/pkg.  s4 is "x" meaning not a manual
+	 * selection, "d" meaning DEBUGSTOP mode, or NULL.
 	 */
 	queuebulk("ports-mgmt", "pkg", NULL, "x");
 
@@ -213,25 +292,66 @@ GetLocalPackageList(void)
 		if (len == 0 || base[len-1] != '\n')
 			continue;
 		base[--len] = 0;
-		if (strtok(base, " \t") == NULL) {
-			printf("Badly formatted pkg info line: %s\n", base);
-			continue;
-		}
-		l1 = strtok(NULL, " \t");
-		if (l1 == NULL) {
-			printf("Badly formatted pkg info line: %s\n", base);
-			continue;
-		}
 
-		l2 = strchr(l1, '/');
-		if (l2) {
+		data = strchr(base, ':');
+		if (data == NULL)
+			continue;
+		*data++ = 0;
+
+		base = strtok(base, " \t\r");
+		data = strtok(data, " \t\r");
+
+		if (base == NULL || data == NULL)
+			continue;
+
+		if (strcmp(base, "Origin") == 0) {
+			if (state == 1) {
+				queuebulk(l1, l2, NULL, NULL);
+				state = 0;
+				++total;
+			}
+
+			if (strchr(data, '/') == NULL) {
+				printf("Badly formatted origin: %s\n", l1);
+			}
+			if (l1)
+				free(l1);
+			if (l3)
+				free(l3);
+			l1 = strdup(data);
+			l2 = strchr(l1, '/');
 			*l2++ = 0;
-			queuebulk(l1, l2, NULL, NULL);
+			l3 = strchr(l2, '@');	/* typically NULL */
+			if (l3) {
+				*l3++ = 0;
+				l3 = strdup(l3);
+			}
+
+			/*
+			 * Don't queue ports-mgmt/pkg twice, we already
+			 * queued it manually.
+			 */
+			if (strcmp(l1, "ports-mgmt") != 0 ||
+			    strcmp(l2, "pkg") != 0) {
+				state = 1;
+			}
+			continue;
+		}
+		if (state == 1 && strcmp(base, "flavor") == 0) {
+			queuebulk(l1, l2, data, NULL);
+			state = 0;
 			++total;
-		} else {
-			printf("Badly formatted specification: %s\n", l1);
 		}
 	}
+	if (state == 1) {
+		queuebulk(l1, l2, NULL, NULL);
+		/*state = 0; not needed */
+	}
+	if (l1)
+		free(l1);
+	if (l3)
+		free(l3);
+
 	pclose(fp);
 
 	printf("Processing %d ports\n", total);
@@ -247,7 +367,6 @@ GetFullPackageList(void)
 	int total;
 
 	initbulk(childGetPackageInfo, MaxBulk);
-
 	total = scan_and_queue_dir(DPortsPath, NULL, 1);
 	printf("Scanning %d ports\n", total);
 
@@ -268,10 +387,14 @@ processPackageListBulk(int total)
 	pkg_t *dep_list;
 	pkg_t **list_tail;
 	int count;
+	int stop_fail;
+	int stop_base_list;
+	int remove_corrupt;
 
 	list = NULL;
 	list_tail = &list;
 	count = 0;
+	remove_corrupt = 0;
 
 	while ((bulk = getbulk()) != NULL) {
 		++count;
@@ -284,7 +407,7 @@ processPackageListBulk(int total)
 			*list_tail = bulk->list;
 			bulk->list = NULL;
 			while ((scan = *list_tail) != NULL) {
-				if (bulk->s4 == NULL)
+				if (bulk->s4 == NULL || bulk->s4[0] != 'x')
 					scan->flags |= PKGF_MANUALSEL;
 				pkg_enter(scan);
 				list_tail = &scan->bnext;
@@ -319,14 +442,81 @@ processPackageListBulk(int total)
 
 	/*
 	 * Do a final count, ignore place holders.
+	 *
+	 * Also set stop_fail if appropriate.  Check for direct specifications
+	 * which fail to probe and any direct dependencies of those
+	 * specifications, but don't recurse (for now)... don't check indirect
+	 * dependencies (i.e. A -> B -> C where A is directly specified, B
+	 * is adirect dependency, and C fails to probe).
 	 */
 	count = 0;
+	stop_fail = 0;
+	stop_base_list = 0;
 	for (scan = list; scan; scan = scan->bnext) {
 		if ((scan->flags & PKGF_ERROR) == 0) {
 			++count;
 		}
+		if ((scan->flags & PKGF_MANUALSEL) && MaskProbeAbort == 0) {
+			pkglink_t *link;
+
+			/*
+			 * Directly specified package failed to probe
+			 */
+			if (scan->flags & PKGF_CORRUPT) {
+				++stop_fail;
+				++stop_base_list;
+			}
+
+			/*
+			 * Directly specified package had a direct dependency
+			 * that failed to probe (don't go further).
+			 */
+			PKGLIST_FOREACH(link, &scan->idepon_list) {
+				if (link->pkg &&
+				    (link->pkg->flags & PKGF_CORRUPT)) {
+					++stop_fail;
+				}
+			}
+		}
 	}
 	printf("Total Returned %d\n", count);
+
+	/*
+	 * Check to see if any PKGF_MANUALSEL packages
+	 */
+	if (stop_fail) {
+		printf("%d packages failed to probe\n", stop_fail);
+		if (PrepareSystemFlag) {
+			if (stop_fail == stop_base_list) {
+				printf(
+  "prepare-system: Some of your installed packages no longer exist in\n"
+  "dports, do you wish to continue rebuilding what does exist?\n");
+			        if (askyn("Continue anyway? "))
+					remove_corrupt = 1;
+			} else {
+				printf(
+  "prepare-system: Some of your installed packages have dependencies\n"
+  "which could not be found in dports, cannot continue, aborting\n");
+			}
+		} else {
+			printf("unable to continue, aborting\n");
+		}
+		if (remove_corrupt == 0)
+			exit(1);
+	}
+
+	/*
+	 * Remove corrupt packages before continuing
+	 */
+	if (remove_corrupt) {
+		list_tail = &list;
+		while ((scan = *list_tail) != NULL) {
+			if (scan->flags & PKGF_CORRUPT)
+				*list_tail = scan->bnext;
+			else
+				list_tail = &scan->bnext;
+		}
+	}
 
 	/*
 	 * Scan our binary distributions and related dependencies looking
@@ -411,33 +601,42 @@ OptimizeEnv(void)
 
 /*
  * Run through the list resolving dependencies and constructing the topology
- * linkages.   This may append packages to the list.
+ * linkages.   This may append packages to the list.  Dependencies to dummy
+ * nodes which do not specify a flavor do not need special handling, the
+ * search code in build.c will properly follow the first flavor.
  */
 static pkg_t *
 resolveDeps(pkg_t *list, pkg_t ***list_tailp, int gentopo)
 {
-	pkg_t *scan;
 	pkg_t *ret_list = NULL;
+	pkg_t *scan;
+	pkg_t *use;
 	bulk_t *bulk;
 
 	for (scan = list; scan; scan = scan->bnext) {
-		resolveDepString(scan, scan->fetch_deps,
+		use = pkg_find(scan->portdir);
+		resolveFlavors(use, scan->flavors, gentopo);
+		resolveDepString(use, scan->fetch_deps,
 				 gentopo, DEP_TYPE_FETCH);
-		resolveDepString(scan, scan->ext_deps,
+		resolveDepString(use, scan->ext_deps,
 				 gentopo, DEP_TYPE_EXT);
-		resolveDepString(scan, scan->patch_deps,
+		resolveDepString(use, scan->patch_deps,
 				 gentopo, DEP_TYPE_PATCH);
-		resolveDepString(scan, scan->build_deps,
+		resolveDepString(use, scan->build_deps,
 				 gentopo, DEP_TYPE_BUILD);
-		resolveDepString(scan, scan->lib_deps,
+		resolveDepString(use, scan->lib_deps,
 				 gentopo, DEP_TYPE_LIB);
-		resolveDepString(scan, scan->run_deps,
+		resolveDepString(use, scan->run_deps,
 				 gentopo, DEP_TYPE_RUN);
 	}
 
 	/*
 	 * No bulk ops are queued when doing the final topology
 	 * generation.
+	 *
+	 * Avoid entering duplicate results from the bulk ops.  Duplicate
+	 * results are mostly filtered out, but not always.  A dummy node
+	 * representing multiple flavors will parse-out the flavors
 	 */
 	if (gentopo)
 		return NULL;
@@ -447,14 +646,95 @@ resolveDeps(pkg_t *list, pkg_t ***list_tailp, int gentopo)
 				ret_list = bulk->list;
 			**list_tailp = bulk->list;
 			bulk->list = NULL;
-			while (**list_tailp) {
-				pkg_enter(**list_tailp);
-				*list_tailp = &(**list_tailp)->bnext;
+			while ((scan = **list_tailp) != NULL) {
+				pkg_enter(scan);
+				*list_tailp = &scan->bnext;
 			}
 		}
 		freebulk(bulk);
 	}
 	return (ret_list);
+}
+
+/*
+ * Resolve a generic node that has flavors, queue to retrieve info for
+ * each flavor and setup linkages as appropriate.
+ */
+static void
+resolveFlavors(pkg_t *pkg, char *flavors, int gentopo)
+{
+	char *flavor_base;
+	char *flavor_scan;
+	char *flavor;
+	char *portdir;
+	char *s1;
+	char *s2;
+	pkg_t *dpkg;
+	pkglink_t *link;
+
+	if ((pkg->flags & PKGF_DUMMY) == 0)
+		return;
+	if (pkg->flavors == NULL || pkg->flavors[0] == 0)
+		return;
+	flavor_base = strdup(flavors);
+	flavor_scan = flavor_base;
+
+	for (;;) {
+		do {
+			flavor = strsep(&flavor_scan, " \t");
+		} while (flavor && *flavor == 0);
+		if (flavor == NULL)
+			break;
+
+		/*
+		 * Iterate each flavor generating "s1/s2@flavor".
+		 *
+		 * queuebulk() info for each flavor, and set-up the
+		 * linkages in the topology generation pass.
+		 */
+		asprintf(&portdir, "%s@%s", pkg->portdir, flavor);
+		s1 = strdup(pkg->portdir);
+		s2 = strchr(s1, '/');
+		*s2++ = 0;
+
+		dpkg = pkg_find(portdir);
+		if (dpkg && gentopo) {
+			/*
+			 * Setup linkages
+			 */
+			free(portdir);
+
+			link = calloc(1, sizeof(*link));
+			link->pkg = dpkg;
+			link->next = &pkg->idepon_list;
+			link->prev = pkg->idepon_list.prev;
+			link->next->prev = link;
+			link->prev->next = link;
+			link->dep_type = DEP_TYPE_BUILD;
+
+			link = calloc(1, sizeof(*link));
+			link->pkg = pkg;
+			link->next = &dpkg->deponi_list;
+			link->prev = dpkg->deponi_list.prev;
+			link->next->prev = link;
+			link->prev->next = link;
+			link->dep_type = DEP_TYPE_BUILD;
+			++dpkg->depi_count;
+		} else if (gentopo == 0 && dpkg == NULL) {
+			/*
+			 * Use a place-holder to prevent duplicate
+			 * dependencies from being processed.  The placeholder
+			 * will be replaced by the actual dependency.
+			 */
+			dpkg = allocpkg();
+			dpkg->portdir = portdir;
+			dpkg->flags = PKGF_PLACEHOLD;
+			pkg_enter(dpkg);
+			queuebulk(s1, s2, flavor, NULL);
+		}
+		free(s1);
+	}
+	free(flavor_base);
 }
 
 static void
@@ -568,11 +848,16 @@ resolveDepString(pkg_t *pkg, char *depstr, int gentopo, int dep_type)
 		}
 		*sep++ = 0;
 
+		/*
+		 * The flavor hangs off the separator, not the tag
+		 */
+		flavor = strrchr(sep, '@');
+#if 0
 		if (tag)
 			flavor = strrchr(tag, '@');
 		else
 			flavor = strrchr(sep, '@');
-
+#endif
 		if (flavor)
 			*flavor++ = 0;
 
@@ -617,10 +902,6 @@ static void
 childGetPackageInfo(bulk_t *bulk)
 {
 	pkg_t *pkg;
-	pkg_t *dummy_node;
-	pkg_t **list_tail;
-	char *flavors_save;
-	char *flavors;
 	char *flavor;
 	char *ptr;
 	FILE *fp;
@@ -638,13 +919,9 @@ childGetPackageInfo(bulk_t *bulk)
 	 * only process the passed-in flavor.
 	 */
 	flavor = bulk->s3;	/* usually NULL */
-	flavors = NULL;
-	flavors_save = NULL;
-	dummy_node = NULL;
 
 	bulk->list = NULL;
-	list_tail = &bulk->list;
-again:
+
 	asprintf(&portpath, "%s/%s/%s", DPortsPath, bulk->s1, bulk->s2);
 	if (flavor)
 		asprintf(&flavarg, "FLAVOR=%s", flavor);
@@ -659,7 +936,7 @@ again:
 		cav[cac++] = flavarg;
 	cav[cac++] = "-VPKGVERSION";
 	cav[cac++] = "-VPKGFILE:T";
-	cav[cac++] = "-VDISTFILES";
+	cav[cac++] = "-VALLFILES";
 	cav[cac++] = "-VDIST_SUBDIR";
 	cav[cac++] = "-VMAKE_JOBS_NUMBER";
 	cav[cac++] = "-VIGNORE";
@@ -700,7 +977,7 @@ again:
 		case 2:		/* PKGFILE */
 			asprintf(&pkg->pkgfile, "%s", ptr);
 			break;
-		case 3:		/* DISTFILES */
+		case 3:		/* ALLFILES (aka DISTFILES + patch files) */
 			asprintf(&pkg->distfiles, "%s", ptr);
 			break;
 		case 4:		/* DIST_SUBDIR */
@@ -769,93 +1046,36 @@ again:
 	ddassert(bulk->s1);
 
 	/*
-	 * Generate flavors
+	 * DEBUGSTOP mode
 	 */
-	if (flavor == NULL) {
-		/*
-		 * If there are flavors add the current unflavored pkg
-		 * as a dummy node so dependencies can attach to it,
-		 * then iterate the first flavor and loop.
-		 *
-		 * We must NULL out pkgfile because it will have the
-		 * default flavor and conflict with the actual flavored
-		 * pkg.
-		 */
-		if (pkg->flavors && pkg->flavors[0]) {
-			dummy_node = pkg;
+	if (bulk->s4 && bulk->s4[0] == 'd')
+		pkg->flags |= PKGF_DEBUGSTOP;
 
-			pkg->flags |= PKGF_DUMMY;
-
-			freestrp(&pkg->fetch_deps);
-			freestrp(&pkg->ext_deps);
-			freestrp(&pkg->patch_deps);
-			freestrp(&pkg->build_deps);
-			freestrp(&pkg->lib_deps);
-			freestrp(&pkg->run_deps);
-
-			freestrp(&pkg->pkgfile);
-			*list_tail = pkg;
-			while (*list_tail)
-				list_tail = &(*list_tail)->bnext;
-
-			flavors_save = strdup(pkg->flavors);
-			flavors = flavors_save;
-			do {
-				flavor = strsep(&flavors, " \t");
-			} while (flavor && *flavor == 0);
-			goto again;
-		}
-
-		/*
-		 * No flavors, add the current unflavored pkg as a real
-		 * node.
-		 */
-		*list_tail = pkg;
-		while (*list_tail)
-			list_tail = &(*list_tail)->bnext;
-	} else {
-		/*
-		 * Add flavored package and iterate.
-		 */
-		*list_tail = pkg;
-		while (*list_tail)
-			list_tail = &(*list_tail)->bnext;
-
-		/*
-		 * Flavor iteration under dummy node, add dependency
-		 */
-		if (dummy_node) {
-			pkglink_t *link;
-
-			ddprintf(0, "Add Dependency %s -> %s (flavor rollup)\n",
-				dummy_node->portdir, pkg->portdir);
-			link = calloc(1, sizeof(*link));
-			link->pkg = pkg;
-			link->next = &dummy_node->idepon_list;
-			link->prev = dummy_node->idepon_list.prev;
-			link->next->prev = link;
-			link->prev->next = link;
-			link->dep_type = DEP_TYPE_BUILD;
-
-			link = calloc(1, sizeof(*link));
-			link->pkg = dummy_node;
-			link->next = &pkg->deponi_list;
-			link->prev = pkg->deponi_list.prev;
-			link->next->prev = link;
-			link->prev->next = link;
-			link->dep_type = DEP_TYPE_BUILD;
-			++pkg->depi_count;
-		}
-
-		if (flavors) {
-			do {
-				flavor = strsep(&flavors, " \t");
-			} while (flavor && *flavor == 0);
-			if (flavor)
-				goto again;
-			free(flavors);
-		}
+	/*
+	 * Mark as a dummy node, the front-end will iterate the flavors
+	 * and create sub-nodes for us.
+	 *
+	 * Get rid of elements returned that are for the first flavor.
+	 * We are creating a dummy node here, not the node for the first
+	 * flavor.
+	 */
+	if (flavor == NULL && pkg->flavors && pkg->flavors[0]) {
+		pkg->flags |= PKGF_DUMMY;
+		freestrp(&pkg->fetch_deps);
+		freestrp(&pkg->ext_deps);
+		freestrp(&pkg->patch_deps);
+		freestrp(&pkg->build_deps);
+		freestrp(&pkg->lib_deps);
+		freestrp(&pkg->run_deps);
+		freestrp(&pkg->pkgfile);
 	}
+
+	/*
+	 * Only one pkg is put on the return list now.  This code no
+	 * longer creates pseudo-nodes for flavors (the frontend requests
+	 * each flavor instead).
+	 */
+	bulk->list = pkg;
 }
 
 /*
@@ -876,6 +1096,7 @@ childGetBinaryDistInfo(bulk_t *bulk)
 	char buf[1024];
 	pid_t pid;
 	int cac;
+	int deleteme;
 
 	asprintf(&repopath, "%s/%s", RepositoryPath, bulk->s1);
 
@@ -887,6 +1108,7 @@ childGetBinaryDistInfo(bulk_t *bulk)
 	cav[cac++] = "%n-%v";
 
 	fp = dexec_open(cav, cac, &pid, NULL, 1, 0);
+	deleteme = DeleteObsoletePkgs;
 
 	while ((ptr = fgetln(fp, &len)) != NULL) {
 		if (len == 0 || ptr[len-1] != '\n')
@@ -897,6 +1119,7 @@ childGetBinaryDistInfo(bulk_t *bulk)
 		pkg = pkg_find(buf);
 		if (pkg) {
 			pkg->flags |= PKGF_PACKAGED;
+			deleteme = 0;
 		} else {
 			ddprintf(0, "Note: package scan, not in list, "
 				    "skipping %s\n", buf);
@@ -904,6 +1127,11 @@ childGetBinaryDistInfo(bulk_t *bulk)
 	}
 	if (dexec_close(fp, pid)) {
 		printf("pkg query command failed for %s\n", repopath);
+	}
+	if (deleteme) {
+		dlog(DLOG_ALL | DLOG_STDOUT,
+		     "Deleting obsolete package %s\n", repopath);
+		remove(repopath);
 	}
 	free(repopath);
 }

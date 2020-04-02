@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2016 François Tigeot
+ * Copyright (c) 2014-2020 François Tigeot <ftigeot@wolfpond.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -31,8 +31,30 @@
 #include <vm/pmap.h>
 #include <vm/vm.h>
 
-#include <linux/types.h>
 #include <asm/page.h>
+#include <linux/string.h>
+#include <linux/types.h>
+
+#undef readb
+static inline u8
+readb(const volatile void __iomem *addr)
+{
+	return *(const volatile u8*)addr;
+}
+
+#undef readw
+static inline u16
+readw(const volatile void __iomem *addr)
+{
+	return *(const volatile u16*)addr;
+}
+
+#undef readl
+static inline u32
+readl(const volatile void __iomem *addr)
+{
+	return *(const volatile u32*)addr;
+}
 
 #undef writeb
 static inline void
@@ -137,6 +159,13 @@ arch_io_reserve_memtype_wc(resource_size_t start, resource_size_t size)
 static inline void
 arch_io_free_memtype_wc(resource_size_t start, resource_size_t size)
 {
+}
+
+#undef outb
+static inline void
+outb(u8 value, u_int port)
+{
+	outbv(port, value);
 }
 
 #endif	/* _ASM_IO_H_ */

@@ -465,7 +465,7 @@ ntfs_mountfs(struct vnode *devvp, struct mount *mp, struct ntfs_args *argsp,
 		vput(vp);
 	}
 
-	mp->mnt_stat.f_fsid.val[0] = dev2udev(dev);
+	mp->mnt_stat.f_fsid.val[0] = devid_from_dev(dev);
 	mp->mnt_stat.f_fsid.val[1] = mp->mnt_vfc->vfc_typenum;
 	mp->mnt_maxsymlinklen = 0;
 	mp->mnt_flag |= MNT_LOCAL;
@@ -761,7 +761,7 @@ ntfs_vgetex(struct mount *mp, ino_t ino, u_int32_t attrtype, char *attrname,
 	}
 
 	error = getnewvnode(VT_NTFS, ntmp->ntm_mountp, &vp, VLKTIMEOUT, 0);
-	if(error) {
+	if (error) {
 		ntfs_frele(fp);
 		ntfs_ntput(ip);
 		return (error);
@@ -785,6 +785,7 @@ ntfs_vgetex(struct mount *mp, ino_t ino, u_int32_t attrtype, char *attrname,
 
 	KKASSERT(lkflags & LK_TYPE_MASK);
 	/* XXX leave vnode locked exclusively from getnewvnode */
+	vx_downgrade(vp);
 	*vpp = vp;
 	return (0);
 }
@@ -797,6 +798,7 @@ ntfs_vget(struct mount *mp, struct vnode *dvp, ino_t ino, struct vnode **vpp)
 }
 
 static struct vfsops ntfs_vfsops = {
+	.vfs_flags =		0,
 	.vfs_mount =    	ntfs_mount,
 	.vfs_unmount =   	ntfs_unmount,
 	.vfs_root =     	ntfs_root,

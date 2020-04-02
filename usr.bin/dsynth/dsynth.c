@@ -42,11 +42,13 @@ static void usage(int ecode) __dead2;
 
 int YesOpt;
 int DebugOpt;
+int MaskProbeAbort;
 int ColorOpt = 1;
 int NullStdinOpt = 1;
-int SlowStartOpt = 1;
+int SlowStartOpt = -1;
 long PkgDepMemoryTarget;
 char *DSynthExecPath;
+char *ProfileOverrideOpt;
 
 int
 main(int ac, char **av)
@@ -74,10 +76,16 @@ main(int ac, char **av)
 	}
 
 	/*
+	 * Override profile in dsynth.ini (can be further overridden
+	 * with the -p profile option).
+	 */
+	ProfileOverrideOpt = getenv("DSYNTH_PROFILE");
+
+	/*
 	 * Process options and make sure the directive is present
 	 */
 	sopt = 0;
-	while ((c = getopt(ac, av, "dhm:vys:DPS")) != -1) {
+	while ((c = getopt(ac, av, "dhm:p:vys:DPS")) != -1) {
 		switch(c) {
 		case 'y':
 			++YesOpt;
@@ -106,11 +114,19 @@ main(int ac, char **av)
 			printf("dsynth %s\n", DSYNTH_VERSION);
 			exit(0);
 		case 's':
+			/*
+			 * Start with N jobs, increasing to the configured
+			 * maximum slowly.  0 to disable (starts with the
+			 * full count).
+			 */
 			SlowStartOpt = strtol(optarg, NULL, 0);
 			break;
 		case 'm':
 			PkgDepMemoryTarget = strtoul(optarg, NULL, 0);
 			PkgDepMemoryTarget *= ONEGB;
+			break;
+		case 'p':
+			ProfileOverrideOpt = optarg;
 			break;
 		default:
 			fprintf(stderr, "Unknown option: %c\n", c);
@@ -128,20 +144,34 @@ main(int ac, char **av)
 		/* NOT REACHED */
 	}
 
+	/*
+	 * Directives which do not require a working configuration
+	 */
 	if (strcmp(av[0], "init") == 0) {
 		DoInit();
 		exit(0);
+		/* NOT REACHED */
+	}
+	if (strcmp(av[0], "help") == 0) {
+		usage(0);
+		exit(0);
+		/* NOT REACHED */
+	}
+	if (strcmp(av[0], "version") == 0) {
+		printf("dsynth %s\n", DSYNTH_VERSION);
+		exit(0);
+		/* NOT REACHED */
 	}
 
+	/*
+	 * Preconfiguration.
+	 */
 	if (strcmp(av[0], "WORKER") == 0) {
 		isworker = 1;
 	} else {
 		isworker = 0;
 	}
 
-	/*
-	 * Preconfiguration.
-	 */
 	signal(SIGPIPE, SIG_IGN);
 	ParseConfiguration(isworker);
 
@@ -170,6 +200,22 @@ main(int ac, char **av)
 	addbuildenv("MACHTYPE", MachineName,
 		    BENV_ENVIRONMENT | BENV_PKGLIST);
 #endif
+	/*
+	 * SlowStart auto adjust.  We nominally start with 1 job and increase
+	 * it to the maximum every 5 seconds to give various dynamic management
+	 * parameters time to stabilize.
+	 *
+	 * This can take a while on a many-core box with a high jobs setting,
+	 * so increase the initial jobs in such cases.
+	 */
+	if (SlowStartOpt > MaxWorkers)
+		SlowStartOpt = MaxWorkers;
+	if (SlowStartOpt < 0) {
+		if (MaxWorkers < 16)
+			SlowStartOpt = 1;
+		else
+			SlowStartOpt = MaxWorkers / 4;
+	}
 
 	/*
 	 * Special directive for when dsynth execs itself to manage
@@ -180,23 +226,16 @@ main(int ac, char **av)
 		exit(0);
 	}
 
+	/*
+	 * Build initialization and directive handling
+	 */
 	DoInitBuild(-1);
 
-	if (strcmp(av[0], "debug") == 0) {
-		WorkerProcFlags |= WORKER_PROC_DEBUGSTOP;
-		DoCleanBuild(1);
-		OptimizeEnv();
-		pkgs = ParsePackageList(ac - 1, av + 1);
-		RemovePackages(pkgs);
-		DoBuild(pkgs);
-	} else if (strcmp(av[0], "status") == 0) {
-		OptimizeEnv();
-		if (ac - 1)
-			pkgs = ParsePackageList(ac - 1, av + 1);
-		else
-			pkgs = GetLocalPackageList();
-		DoStatus(pkgs);
-	} else if (strcmp(av[0], "monitor") == 0) {
+	/*
+	 * Directives that use the configuration but are not interlocked
+	 * against a running dsynth.
+	 */
+	if (strcmp(av[0], "monitor") == 0) {
 		char *spath;
 		char *lpath;
 
@@ -209,6 +248,43 @@ main(int ac, char **av)
 		} else {
 			MonitorDirective(av[1], NULL);
 		}
+		exit(0);
+		/* NOT REACHED */
+	}
+
+	/*
+	 * Front-end exec (not a WORKER exec), normal startup.  We have
+	 * the configuration so the first thing we need to do is check
+	 * the lock file.
+	 */
+	{
+		char *lkpath;
+		int fd;
+
+		asprintf(&lkpath, "%s/.lock", BuildBase);
+		fd = open(lkpath, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+		if (fd < 0)
+			dfatal_errno("Unable to create %s", lkpath);
+		if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+			dfatal("Another dsynth is using %s, exiting",
+			       BuildBase);
+		}
+		/* leave descriptor open */
+	}
+
+	if (strcmp(av[0], "debug") == 0) {
+		DoCleanBuild(1);
+		OptimizeEnv();
+		pkgs = ParsePackageList(ac - 1, av + 1, 1);
+		RemovePackages(pkgs);
+		DoBuild(pkgs);
+	} else if (strcmp(av[0], "status") == 0) {
+		OptimizeEnv();
+		if (ac - 1)
+			pkgs = ParsePackageList(ac - 1, av + 1, 0);
+		else
+			pkgs = GetLocalPackageList();
+		DoStatus(pkgs);
 	} else if (strcmp(av[0], "cleanup") == 0) {
 		DoCleanBuild(0);
 	} else if (strcmp(av[0], "configure") == 0) {
@@ -241,41 +317,36 @@ main(int ac, char **av)
 	} else if (strcmp(av[0], "everything") == 0) {
 		if (WorkerProcFlags & WORKER_PROC_DEVELOPER)
 			WorkerProcFlags |= WORKER_PROC_CHECK_PLIST;
+		MaskProbeAbort = 1;
+		DeleteObsoletePkgs = 1;
 		DoCleanBuild(1);
 		OptimizeEnv();
 		pkgs = GetFullPackageList();
 		DoBuild(pkgs);
 		DoRebuildRepo(1);
-	} else if (strcmp(av[0], "version") == 0) {
-		printf("dsynth %s\n", DSYNTH_VERSION);
-		exit(0);
-	} else if (strcmp(av[0], "help") == 0) {
-		usage(0);
-		/* NOT REACHED */
-		exit(0);
 	} else if (strcmp(av[0], "build") == 0) {
 		DoCleanBuild(1);
 		OptimizeEnv();
-		pkgs = ParsePackageList(ac - 1, av + 1);
+		pkgs = ParsePackageList(ac - 1, av + 1, 0);
 		DoBuild(pkgs);
 		DoRebuildRepo(1);
 		DoUpgradePkgs(pkgs, 1);
 	} else if (strcmp(av[0], "just-build") == 0) {
 		DoCleanBuild(1);
 		OptimizeEnv();
-		pkgs = ParsePackageList(ac - 1, av + 1);
+		pkgs = ParsePackageList(ac - 1, av + 1, 0);
 		DoBuild(pkgs);
 	} else if (strcmp(av[0], "install") == 0) {
 		DoCleanBuild(1);
 		OptimizeEnv();
-		pkgs = ParsePackageList(ac - 1, av + 1);
+		pkgs = ParsePackageList(ac - 1, av + 1, 0);
 		DoBuild(pkgs);
 		DoRebuildRepo(0);
 		DoUpgradePkgs(pkgs, 0);
 	} else if (strcmp(av[0], "force") == 0) {
 		DoCleanBuild(1);
 		OptimizeEnv();
-		pkgs = ParsePackageList(ac - 1, av + 1);
+		pkgs = ParsePackageList(ac - 1, av + 1, 0);
 		RemovePackages(pkgs);
 		DoBuild(pkgs);
 		DoRebuildRepo(1);
@@ -284,7 +355,7 @@ main(int ac, char **av)
 		WorkerProcFlags |= WORKER_PROC_CHECK_PLIST;
 		DoCleanBuild(1);
 		OptimizeEnv();
-		pkgs = ParsePackageList(ac - 1, av + 1);
+		pkgs = ParsePackageList(ac - 1, av + 1, 0);
 		RemovePackages(pkgs);
 		WorkerProcFlags |= WORKER_PROC_DEVELOPER;
 		DoBuild(pkgs);
@@ -292,7 +363,6 @@ main(int ac, char **av)
 		fprintf(stderr, "Unknown directive '%s'\n", av[0]);
 		usage(2);
 	}
-
 	return 0;
 }
 
@@ -384,9 +454,10 @@ usage(int ecode)
     "    -d                   - Debug verbosity (-dd disables ncurses)\n"
     "    -h                   - Display this screen and exit\n"
     "    -m gb                - Load management based on pkgdep memory\n"
+    "    -p profile           - Override profile selected in dsynth.ini\n"
+    "    -s n                 - Set initial DynamicMaxWorkers\n"
     "    -v                   - Print version info and exit\n"
     "    -y                   - Automatically answer yes to dsynth questions\n"
-    "    -s n                 - Set initial DynamicMaxWorkers\n"
     "    -D                   - Enable DEVELOPER mode\n"
     "    -P                   - Include the check-plist stage\n"
     "    -S                   - Disable ncurses\n"

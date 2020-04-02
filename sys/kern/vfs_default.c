@@ -49,7 +49,6 @@
 #include <sys/unistd.h>
 #include <sys/vnode.h>
 #include <sys/namei.h>
-#include <sys/nlookup.h>
 #include <sys/mountctl.h>
 #include <sys/vfs_quota.h>
 
@@ -79,6 +78,7 @@ struct vop_ops default_vnode_vops = {
 	.vop_old_lookup		= vop_nolookup,
 	.vop_open		= vop_stdopen,
 	.vop_close		= vop_stdclose,
+	.vop_getattr_quick	= vop_stdgetattr_quick,
 	.vop_pathconf		= vop_stdpathconf,
 	.vop_readlink		= (void *)vop_einval,
 	.vop_reallocblks	= (void *)vop_eopnotsupp,
@@ -1214,6 +1214,17 @@ vop_stdclose(struct vop_close_args *ap)
 }
 
 /*
+ * Standard getattr_quick
+ *
+ * Just calls getattr
+ */
+int
+vop_stdgetattr_quick(struct vop_getattr_args *ap)
+{
+	return VOP_GETATTR(ap->a_vp, ap->a_vap);
+}
+
+/*
  * Implement standard getpages and putpages.  All filesystems must use
  * the buffer cache to back regular files.
  */
@@ -1488,9 +1499,11 @@ vfs_stdncpgen_test(struct mount *mp, struct namecache *ncp)
 	return 0;
 }
 
-void
+int
 vfs_stdmodifying(struct mount *mp)
 {
-	/* do nothing */
+	if (mp->mnt_flag & MNT_RDONLY)
+		return EROFS;
+	return 0;
 }
 /* end of vfs default ops */

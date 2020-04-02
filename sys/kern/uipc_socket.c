@@ -217,7 +217,7 @@ socreate(int dom, struct socket **aso, int type,
 	if (prp == NULL || prp->pr_usrreqs->pru_attach == 0)
 		return (EPROTONOSUPPORT);
 
-	if (pr && pr->pr_socket_unixiproute_only &&
+	if (pr && PRISON_CAP_ISSET(pr->pr_caps, PRISON_CAP_NET_UNIXIPROUTE) &&
 	    prp->pr_domain->dom_family != PF_LOCAL &&
 	    prp->pr_domain->dom_family != PF_INET &&
 	    prp->pr_domain->dom_family != PF_INET6 &&
@@ -2585,6 +2585,8 @@ filt_soread(struct knote *kn, long hint __unused)
 		if (kn->kn_data == 0)
 			kn->kn_flags |= EV_NODATA;
 		kn->kn_flags |= EV_EOF; 
+		if (so->so_state & SS_CANTSENDMORE)
+			kn->kn_flags |= EV_HUP;
 		kn->kn_fflags = so->so_error;
 		return (1);
 	}
@@ -2619,6 +2621,8 @@ filt_sowrite(struct knote *kn, long hint __unused)
 
 	if (so->so_state & SS_CANTSENDMORE) {
 		kn->kn_flags |= (EV_EOF | EV_NODATA);
+		if (so->so_state & SS_CANTRCVMORE)
+			kn->kn_flags |= EV_HUP;
 		kn->kn_fflags = so->so_error;
 		return (1);
 	}

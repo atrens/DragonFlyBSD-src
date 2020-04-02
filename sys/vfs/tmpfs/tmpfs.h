@@ -164,6 +164,7 @@ struct tmpfs_node {
 	/* Node's internal status.  This is used by several file system
 	 * operations to do modifications to the node in a delayed
 	 * fashion. */
+	int			tn_blksize;	/* small file optimization */
 	int			tn_status;
 #define	TMPFS_NODE_ACCESSED	(1 << 1)
 #define	TMPFS_NODE_MODIFIED	(1 << 2)
@@ -178,7 +179,7 @@ struct tmpfs_node {
 	gid_t			tn_gid;
 	mode_t			tn_mode;
 	u_int			tn_flags;
-	nlink_t			tn_links;
+	nlink_t			tn_links;	/* atomic ops req */
 	long			tn_atime;
 	long			tn_atimensec;
 	long			tn_mtime;
@@ -204,11 +205,11 @@ struct tmpfs_node {
 	 * allocated for it or it has been reclaimed). */
 	struct vnode *		tn_vnode;
 
-	/* interlock to protect tn_vpstate */
+	/* interlock to protect structure */
 	struct lock		tn_interlock;
 
-	/* Identify if current node has vnode assiocate with
-	 * or allocating vnode.
+	/*
+	 * tmpfs vnode state, may specify an allocation in-progress.
 	 */
 	int		tn_vpstate;
 
@@ -296,9 +297,7 @@ LIST_HEAD(tmpfs_node_list, tmpfs_node);
 #define TMPFS_ASSERT_ELOCKED(node) (void)0
 #endif  /* INVARIANTS */
 
-#define TMPFS_VNODE_ALLOCATING	1
-#define TMPFS_VNODE_WANT	2
-#define TMPFS_VNODE_DOOMED	4
+#define TMPFS_VNODE_DOOMED	0x0001
 /* --------------------------------------------------------------------- */
 
 /*
@@ -427,6 +426,10 @@ void	tmpfs_itimes(struct vnode *, const struct timespec *,
 void	tmpfs_update(struct vnode *);
 int	tmpfs_truncate(struct vnode *, off_t);
 boolean_t tmpfs_node_ctor(void *obj, void *privdata, int flags);
+void	tmpfs_lock4(struct tmpfs_node *node1, struct tmpfs_node *node2,
+		struct tmpfs_node *node3, struct tmpfs_node *node4);
+void	tmpfs_unlock4(struct tmpfs_node *node1, struct tmpfs_node *node2,
+		struct tmpfs_node *node3, struct tmpfs_node *node4);
 
 /* --------------------------------------------------------------------- */
 

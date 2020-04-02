@@ -49,7 +49,6 @@
 #include <sys/fcntl.h>
 #include <sys/buf.h>
 #include <sys/proc.h>
-#include <sys/namei.h>
 #include <sys/mount.h>
 #include <sys/vnode.h>
 #include <sys/mountctl.h>
@@ -1505,7 +1504,7 @@ hammer2_dedup_record(hammer2_chain_t *chain, hammer2_io_t *dio,
 		atomic_clear_int(&chain->flags, HAMMER2_CHAIN_MODIFIED);
 		atomic_add_long(&hammer2_count_modified_chains, -1);
 		if (chain->pmp)
-			hammer2_pfs_memory_wakeup(chain->pmp);
+			hammer2_pfs_memory_wakeup(chain->pmp, -1);
 	}
 #endif
 }

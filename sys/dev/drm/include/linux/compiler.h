@@ -3,7 +3,7 @@
  * Copyright (c) 2010 iX Systems, Inc.
  * Copyright (c) 2010 Panasas, Inc.
  * Copyright (c) 2013-2016 Mellanox Technologies, Ltd.
- * Copyright (c) 2015-2019 François Tigeot <ftigeot@wolfpond.org>
+ * Copyright (c) 2015-2020 François Tigeot <ftigeot@wolfpond.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -57,12 +57,13 @@
 #define	__attribute_const__		__attribute__((__const__))
 #undef __always_inline
 #define	__always_inline			inline
+#define noinline			__attribute__((noinline))
 
 #define	likely(x)			__builtin_expect(!!(x), 1)
 #define	unlikely(x)			__builtin_expect(!!(x), 0)
 #define typeof(x)			__typeof(x)
 
-/*#define __read_mostly REMOVED - defined by DFly now */
+#define __maybe_unused			__unused
 #define __always_unused			__unused
 #define __malloc
 #define __must_check			__heedresult

@@ -31,13 +31,11 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#if HAVE_NBTOOL_CONFIG_H
-#include "nbtool_config.h"
-#endif
 
 #include <sys/param.h>
 
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>

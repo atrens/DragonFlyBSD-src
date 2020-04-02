@@ -1,4 +1,36 @@
 /*
+ * Copyright (c) 2003-2020 The DragonFly Project.  All rights reserved.
+ *
+ * This code is derived from software contributed to The DragonFly Project
+ * by Matthew Dillon <dillon@backplane.com>
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in
+ *    the documentation and/or other materials provided with the
+ *    distribution.
+ * 3. Neither the name of The DragonFly Project nor the names of its
+ *    contributors may be used to endorse or promote products derived
+ *    from this software without specific, prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE
+ * COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+ * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ *
  * Copyright (c) 1991 Regents of the University of California.
  * All rights reserved.
  * Copyright (c) 1994 John S. Dyson
@@ -60,12 +92,10 @@
  *
  * any improvements or extensions that they make and grant Carnegie the
  * rights to redistribute these changes.
- *
- * $FreeBSD: src/sys/vm/vm_pageout.c,v 1.151.2.15 2002/12/29 18:21:04 dillon Exp $
  */
 
 /*
- *	The proverbial page-out daemon.
+ * The proverbial page-out daemon, rewritten many times over the decades.
  */
 
 #include "opt_vm.h"
@@ -106,8 +136,8 @@ static int vm_pageout_page(vm_page_t m, long *max_launderp,
 static int vm_pageout_clean_helper (vm_page_t, int);
 static void vm_pageout_free_page_calc (vm_size_t count);
 static void vm_pageout_page_free(vm_page_t m) ;
-struct thread *emergpager;
-struct thread *pagethread;
+__read_frequently struct thread *emergpager;
+__read_frequently struct thread *pagethread;
 static int sequence_emerg_pager;
 
 #if !defined(NO_SWAPPING)
@@ -123,11 +153,11 @@ static struct kproc_desc vm_kp = {
 SYSINIT(vmdaemon, SI_SUB_KTHREAD_VM, SI_ORDER_FIRST, kproc_start, &vm_kp);
 #endif
 
-int vm_pages_needed = 0;	/* Event on which pageout daemon sleeps */
-int vm_pageout_deficit = 0;	/* Estimated number of pages deficit */
-int vm_pageout_pages_needed = 0;/* pageout daemon needs pages */
-int vm_page_free_hysteresis = 16;
-static int vm_pagedaemon_time;
+__read_mostly int vm_pages_needed = 0;	/* pageout daemon tsleep event */
+__read_mostly int vm_pageout_deficit = 0;/* Estimated number of pages deficit */
+__read_mostly int vm_pageout_pages_needed = 0;/* pageout daemon needs pages */
+__read_mostly int vm_page_free_hysteresis = 16;
+__read_mostly static int vm_pagedaemon_time;
 
 #if !defined(NO_SWAPPING)
 static int vm_pageout_req_swapout;
@@ -153,7 +183,8 @@ __read_mostly static int vm_swap_idle_enabled=0;
 #endif
 
 /* 0-disable, 1-passive, 2-active swp*/
-__read_mostly int vm_pageout_memuse_mode=1;
+__read_mostly int vm_pageout_memuse_mode=2;
+__read_mostly int vm_pageout_allow_active=1;
 
 SYSCTL_UINT(_vm, VM_PAGEOUT_ALGORITHM, anonmem_decline,
 	CTLFLAG_RW, &vm_anonmem_decline, 0, "active->inactive anon memory");
@@ -183,6 +214,8 @@ SYSCTL_INT(_vm, OID_AUTO, pageout_stats_free_max,
 	CTLFLAG_RW, &vm_pageout_stats_free_max, 0, "Not implemented");
 SYSCTL_INT(_vm, OID_AUTO, pageout_memuse_mode,
 	CTLFLAG_RW, &vm_pageout_memuse_mode, 0, "memoryuse resource mode");
+SYSCTL_INT(_vm, OID_AUTO, pageout_allow_active,
+	CTLFLAG_RW, &vm_pageout_allow_active, 0, "allow inactive+active");
 SYSCTL_INT(_vm, OID_AUTO, pageout_debug,
 	CTLFLAG_RW, &vm_pageout_debug, 0, "debug pageout pages (count)");
 
@@ -446,7 +479,7 @@ vm_pageout_flush(vm_page_t *mc, int count, int vmflush_flags)
 	 * of our soft-busy.
 	 */
 	if (dodebug)
-		kprintf("pageout: ");
+		kprintf("pageout(%d): ", count);
 	for (i = 0; i < count; i++) {
 		if (vmflush_flags & VM_PAGER_TRY_TO_CACHE)
 			vm_page_protect(mc[i], VM_PROT_NONE);
@@ -544,7 +577,7 @@ vm_pageout_flush(vm_page_t *mc, int count, int vmflush_flags)
 		}
 	}
 	if (dodebug)
-		kprintf("\n");
+		kprintf("(%d paged out)\n", numpagedout);
 	return numpagedout;
 }
 
@@ -630,6 +663,8 @@ vm_pageout_mdp_callback(struct pmap_pgscan_info *info, vm_offset_t va,
 	 * Once the page has been removed from the pmap the RSS code no
 	 * longer tracks it so we have to make sure that it is staged for
 	 * potential flush action.
+	 *
+	 * XXX
 	 */
 	if ((p->flags & PG_MAPPED) == 0 ||
 	    (pmap_mapped_sync(p) & PG_MAPPED) == 0) {
@@ -820,6 +855,10 @@ vm_pageout_scan_inactive(int pass, int q, long avail_shortage,
 	/*
 	 * Inactive queue scan.
 	 *
+	 * We pick off approximately 1/10 of each queue.  Each queue is
+	 * effectively organized LRU so scanning the entire queue would
+	 * improperly pick up pages that might still be in regular use.
+	 *
 	 * NOTE: The vm_page must be spinlocked before the queue to avoid
 	 *	 deadlocks, so it is easiest to simply iterate the loop
 	 *	 with the queue unlocked at the top.
@@ -828,7 +867,7 @@ vm_pageout_scan_inactive(int pass, int q, long avail_shortage,
 
 	vm_page_queues_spin_lock(PQ_INACTIVE + q);
 	TAILQ_INSERT_HEAD(&vm_page_queues[PQ_INACTIVE + q].pl, &marker, pageq);
-	maxscan = vm_page_queues[PQ_INACTIVE + q].lcnt;
+	maxscan = vm_page_queues[PQ_INACTIVE + q].lcnt / 10 + 1;
 
 	/*
 	 * Queue locked at top of loop to avoid stack marker issues.
@@ -915,14 +954,19 @@ vm_pageout_scan_inactive(int pass, int q, long avail_shortage,
 
 		/*
 		 * Try to pageout the page and perhaps other nearby pages.
-		 * We want to get the pages into the cache on the second
-		 * pass.  Otherwise the pages can wind up just cycling in
-		 * the inactive queue, getting flushed over and over again.
+		 * We want to get the pages into the cache eventually (
+		 * first or second pass).  Otherwise the pages can wind up
+		 * just cycling in the inactive queue, getting flushed over
+		 * and over again.
 		 */
+		if (vm_pageout_memuse_mode >= 2)
+			vm_page_flag_set(m, PG_WINATCFLS);
+
+		vmflush_flags = 0;
+		if (vm_pageout_allow_active)
+			vmflush_flags |= VM_PAGER_ALLOW_ACTIVE;
 		if (m->flags & PG_WINATCFLS)
-			vmflush_flags = VM_PAGER_TRY_TO_CACHE;
-		else
-			vmflush_flags = 0;
+			vmflush_flags |= VM_PAGER_TRY_TO_CACHE;
 		count = vm_pageout_page(m, &max_launder, vnodes_skipped,
 					&vpfailed, pass, vmflush_flags);
 		delta += count;
@@ -1351,7 +1395,7 @@ vm_pageout_scan_active(int pass, int q,
 
 	vm_page_queues_spin_lock(PQ_ACTIVE + q);
 	TAILQ_INSERT_HEAD(&vm_page_queues[PQ_ACTIVE + q].pl, &marker, pageq);
-	maxscan = vm_page_queues[PQ_ACTIVE + q].lcnt;
+	maxscan = vm_page_queues[PQ_ACTIVE + q].lcnt / 10 + 1;
 
 	/*
 	 * Queue locked at top of loop to avoid stack marker issues.
@@ -1611,11 +1655,11 @@ vm_pageout_scan_cache(long avail_shortage, int pass,
 		m = vm_page_list_find(PQ_CACHE, cache_rover[isep] & PQ_L2_MASK);
 		if (m == NULL)
 			break;
-
 		/*
+		 * page is returned removed from its queue and spinlocked
+		 *
 		 * If the busy attempt fails we can still deactivate the page.
 		 */
-		/* page is returned removed from its queue and spinlocked */
 		if (vm_page_busy_try(m, TRUE)) {
 			vm_page_deactivate_locked(m);
 			vm_page_spin_unlock(m);
@@ -1636,6 +1680,10 @@ vm_pageout_scan_cache(long avail_shortage, int pass,
 			vm_page_wakeup(m);
 			continue;
 		}
+
+		/*
+		 * Because the page is in the cache, it shouldn't be mapped.
+		 */
 		pmap_mapped_sync(m);
 		KKASSERT((m->flags & PG_MAPPED) == 0);
 		KKASSERT(m->dirty == 0);
@@ -2262,6 +2310,22 @@ skip_setup:
 					++qq;
 				if (avail_shortage - delta <= 0)
 					break;
+
+				/*
+				 * It is possible for avail_shortage to be
+				 * very large.  If a large program exits or
+				 * frees a ton of memory all at once, we do
+				 * not have to continue deactivations.
+				 *
+				 * (We will still run the active->inactive
+				 * target, however).
+				 */
+				if (!vm_page_count_target() &&
+				    !vm_page_count_min(
+						vm_page_free_hysteresis)) {
+					avail_shortage = 0;
+					break;
+				}
 			}
 			avail_shortage -= delta;
 			q1iterator = qq;
@@ -2340,6 +2404,18 @@ skip_setup:
 				    avail_shortage - delta <= 0) {
 					break;
 				}
+
+				/*
+				 * inactive_shortage can be a very large
+				 * number.  This is intended to break out
+				 * early if our inactive_target has been
+				 * reached due to other system activity.
+				 */
+				if (vmstats.v_inactive_count >
+				    vmstats.v_inactive_target) {
+					inactive_shortage = 0;
+					break;
+				}
 			}
 			inactive_shortage -= delta;
 			avail_shortage -= delta;
@@ -2360,10 +2436,17 @@ skip_setup:
 				      vnodes_skipped, recycle_count);
 
 		/*
-		 * Wait for more work.
+		 * This is a bit sophisticated because we do not necessarily
+		 * want to force paging until our targets are reached if we
+		 * were able to successfully retire the shortage we calculated.
 		 */
 		if (avail_shortage > 0) {
+			/*
+			 * If we did not retire enough pages continue the
+			 * pageout operation until we are able to.
+			 */
 			++pass;
+
 			if (pass < 10 && vm_pages_needed > 1) {
 				/*
 				 * Normal operation, additional processes
@@ -2377,19 +2460,18 @@ skip_setup:
 				} /* else immediate retry */
 			} else if (pass < 10) {
 				/*
-				 * Normal operation, fewer processes.  Delay
-				 * a bit but allow wakeups.  vm_pages_needed
-				 * is only adjusted against the primary
-				 * pagedaemon here.
+				 * Do a short sleep for the first 10 passes,
+				 * allow the sleep to be woken up by resetting
+				 * vm_pages_needed to 1 (NOTE: we are still
+				 * active paging!).
 				 */
 				if (isep == 0)
-					vm_pages_needed = 0;
-				tsleep(&vm_pages_needed, 0, "pdelay", hz / 10);
-				if (isep == 0)
 					vm_pages_needed = 1;
+				tsleep(&vm_pages_needed, 0, "pdelay", 2);
 			} else if (swap_pager_full == 0) {
 				/*
-				 * We've taken too many passes, forced delay.
+				 * We've taken too many passes, force a
+				 * longer delay.
 				 */
 				tsleep(&vm_pages_needed, 0, "pdelay", hz / 10);
 			} else {
@@ -2401,18 +2483,37 @@ skip_setup:
 			}
 		} else if (vm_pages_needed) {
 			/*
-			 * Interlocked wakeup of waiters (non-optional).
+			 * We retired our calculated shortage but we may have
+			 * to continue paging if threads drain memory too far
+			 * below our target.
 			 *
-			 * Similar to vm_page_free_wakeup() in vm_page.c,
-			 * wake
+			 * Similar to vm_page_free_wakeup() in vm_page.c.
 			 */
 			pass = 0;
-			if (!vm_page_count_min(vm_page_free_hysteresis) ||
-			    !vm_page_count_target()) {
+			if (!vm_paging_needed(0)) {
+				/* still more than half-way to our target */
 				vm_pages_needed = 0;
 				wakeup(&vmstats.v_free_count);
+			} else
+			if (!vm_page_count_min(vm_page_free_hysteresis)) {
+				/*
+				 * Continue operations with wakeup
+				 * (set variable to avoid overflow)
+				 */
+				vm_pages_needed = 2;
+				wakeup(&vmstats.v_free_count);
+			} else {
+				/*
+				 * No wakeup() needed, continue operations.
+				 * (set variable to avoid overflow)
+				 */
+				vm_pages_needed = 2;
 			}
 		} else {
+			/*
+			 * Turn paging back on immediately if we are under
+			 * minimum.
+			 */
 			pass = 0;
 		}
 	}
@@ -2452,11 +2553,12 @@ void
 pagedaemon_wakeup(void)
 {
 	if (vm_paging_needed(0) && curthread != pagethread) {
-		if (vm_pages_needed == 0) {
-			vm_pages_needed = 1;	/* SMP race ok */
-			wakeup(&vm_pages_needed);
+		if (vm_pages_needed <= 1) {
+			vm_pages_needed = 1;		/* SMP race ok */
+			wakeup(&vm_pages_needed);	/* tickle pageout */
 		} else if (vm_page_count_min(0)) {
-			++vm_pages_needed;	/* SMP race ok */
+			++vm_pages_needed;		/* SMP race ok */
+			/* a wakeup() would be wasted here */
 		}
 	}
 }

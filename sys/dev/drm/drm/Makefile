@@ -55,9 +55,9 @@ SRCS	= \
 	drm_sysfs.c \
 	drm_vm.c \
 	drm_vma_manager.c \
-	linux_sched.c \
 	linux_async.c \
 	linux_compat.c \
+	linux_completion.c \
 	linux_dma.c \
 	linux_dma-buf.c \
 	linux_dmi.c \
@@ -69,11 +69,14 @@ SRCS	= \
 	linux_iomapping.c \
 	linux_irq.c \
 	linux_kobject.c \
+	linux_kthread.c \
 	linux_list_sort.c \
 	linux_reservation.c \
 	linux_scatterlist.c \
+	linux_sched.c \
 	linux_shmem.c \
 	linux_sort.c \
+	linux_tasklet.c \
 	linux_vmalloc.c \
 	linux_wait.c \
 	linux_workqueue.c \
@@ -91,8 +94,13 @@ SRCS	= \
 # if CONFIG_AGP is set
 #SRCS+=	drm_agpsupport.c \
 
-SRCS   += device_if.h bus_if.h pci_if.h opt_drm.h \
-	  opt_vm.h
+SRCS	+= \
+	opt_ddb.h \
+	opt_drm.h \
+	opt_vm.h \
+	bus_if.h \
+	device_if.h \
+	pci_if.h
 
 KCFLAGS+= -I${SYSDIR}/dev/drm/include
 KCFLAGS+= -I${SYSDIR}/dev/drm/include/drm

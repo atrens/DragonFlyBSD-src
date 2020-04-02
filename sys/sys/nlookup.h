@@ -71,7 +71,8 @@ struct nlookupdata {
 	 * a pure thread.  The result from nlookup() will be returned in
 	 * nl_nch.
 	 */
-	struct nchandle nl_nch;		/* start-point and result */
+	struct nchandle nl_nch;		/* result */
+	struct nchandle *nl_basench;	/* start-point directory */
 	struct nchandle nl_rootnch;	/* root directory */
 	struct nchandle nl_jailnch;	/* jail directory */
 
@@ -82,6 +83,8 @@ struct nlookupdata {
 
 	int		nl_flags;	/* operations flags */
 	int		nl_loopcnt;	/* symlinks encountered */
+	int		nl_unused01;	/* start at nl_path + nl_startidx */
+	int		nl_elmno;	/* iteration# to help caches */
 
 	/*
 	 * These fields are populated by vn_open().  nlookup_done() will
@@ -116,9 +119,10 @@ struct nlookupdata {
 #define NLC_NFS_RDONLY		0x00010000	/* set by nfs_namei() only */
 #define NLC_NFS_NOSOFTLINKTRAV	0x00020000	/* do not traverse softlnks */
 #define NLC_REFDVP		0x00040000	/* set ref'd/unlocked nl_dvp */
+#define NLC_EXCLLOCK_IFEXEC	0x00080000	/* use excl lock if 'x' */
 
 #define NLC_APPEND		0x00100000	/* open check: append */
-#define NLC_NCDIR		0x00200000	/* nd->nl_nch is ncdir */
+#define NLC_NLNCH_NOINIT	0x00200000	/* caller will initialize */
 
 #define NLC_READ		0x00400000	/* require read access */
 #define NLC_WRITE		0x00800000	/* require write access */
@@ -138,6 +142,9 @@ struct nlookupdata {
 #define NLC_ALLCHKS		(NLC_CREATE | NLC_DELETE | NLC_RENAME_DST | \
 				 NLC_OPEN | NLC_TRUNCATE | NLC_RENAME_SRC | \
 				 NLC_READ | NLC_WRITE | NLC_EXEC | NLC_OWN)
+
+#define NLC_MODIFYING_MASK	(NLC_CREATE | NLC_DELETE | NLC_RENAME_DST | \
+				 NLC_RENAME_SRC)
 
 #ifdef _KERNEL
 #include <sys/_uio.h>

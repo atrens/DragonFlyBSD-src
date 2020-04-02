@@ -80,7 +80,7 @@
         ..
     ..
     libexec
-        binutils225
+        binutils227
             bfd-plugins
             ..
             ldscripts
@@ -88,7 +88,7 @@
             elf
             ..
         ..
-        binutils227
+        binutils234
             bfd-plugins
             ..
             ldscripts

@@ -59,7 +59,6 @@
 #define cpu_setstack(lp, ap)		((lp)->lwp_md.md_regs[SP] = (ap))
 
 #define CLKF_INTR(intr_nest)	((intr_nest) > 1)
-#define CLKF_INTR_TD(td)	((td)->td_flags & TDF_INTTHREAD)
 #define	CLKF_PC(framep)		((framep)->if_rip)
 
 /*
@@ -98,6 +97,11 @@
     (mycpu->gd_reqflags & RQF_AST_LWKT_RESCHED)
 #define	any_resched_wanted()	\
     (mycpu->gd_reqflags & (RQF_AST_LWKT_RESCHED|RQF_AST_USER_RESCHED))
+
+#define any_action_wanted_gd(gd)			\
+    ((gd)->gd_reqflags & (RQF_AST_LWKT_RESCHED |	\
+			  RQF_AST_USER_RESCHED |	\
+			  RQF_IDLECHECK_MASK))
 
 /*
  * CTL_MACHDEP definitions.

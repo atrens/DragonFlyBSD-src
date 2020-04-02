@@ -33,6 +33,7 @@
 #ifndef _SYS_MOUNT_H_
 #define _SYS_MOUNT_H_
 
+#include <sys/mplock2.h>
 #include <sys/queue.h>
 #include <sys/tree.h>
 #include <sys/ucred.h>
@@ -233,7 +234,7 @@ struct mount {
 
 	/*
 	 * ops vectors have a fixed stacking order.  All primary calls run
-	 * through mnt_vn_ops.  This field is typically assigned to 
+	 * through mnt_vn_ops.  This field is typically assigned to
 	 * mnt_vn_norm_ops.  If journaling has been enabled this field is
 	 * usually assigned to mnt_vn_journal_ops.
 	 */
@@ -246,7 +247,8 @@ struct mount {
 	struct vop_ops	*mnt_vn_fifo_ops;	/* for use by the VFS */
 	struct nchandle mnt_ncmountpt;		/* mount point */
 	struct nchandle mnt_ncmounton;		/* mounted on */
-	char		mnt_pad[24];		/* (try to cache-align refs) */
+	char		mnt_pad[16];		/* (try to cache-align refs) */
+	struct ucred	*mnt_cred;		/* for cr_prison */
 	int		mnt_refs;		/* nchandle references */
 	int		mnt_hold;		/* prevent kfree */
 	struct lwkt_token mnt_token;		/* token lock if not MPSAFE */
@@ -367,6 +369,7 @@ struct mount {
 #define MNTSCAN_FORWARD		0x0001
 #define MNTSCAN_REVERSE		0x0002
 #define MNTSCAN_NOBUSY		0x0004
+#define MNTSCAN_NOUNLOCK	0x0008
 
 #define MNTINS_FIRST		0x0001
 #define MNTINS_LAST		0x0002
@@ -571,7 +574,7 @@ typedef void vfs_account_t(struct mount *mp,
 			uid_t uid, gid_t gid, int64_t delta);
 typedef void vfs_ncpgen_set_t(struct mount *mp, struct namecache *ncp);
 typedef int vfs_ncpgen_test_t(struct mount *mp, struct namecache *ncp);
-typedef void vfs_modifying_t(struct mount *mp);
+typedef int vfs_modifying_t(struct mount *mp);
 
 int vfs_mount(struct mount *mp, char *path, caddr_t data, struct ucred *cred);
 int vfs_start(struct mount *mp, int flags);
@@ -597,6 +600,7 @@ int vfs_extattrctl(struct mount *mp, int cmd, struct vnode *vp,
 int vfs_modifying(struct mount *mp);
 
 struct vfsops {
+	long		vfs_flags;
 	vfs_mount_t 	*vfs_mount;
 	vfs_start_t 	*vfs_start;
 	vfs_unmount_t 	*vfs_unmount;
@@ -619,6 +623,8 @@ struct vfsops {
 	vfs_ncpgen_test_t	*vfs_ncpgen_test;
 	vfs_modifying_t	*vfs_modifying;
 };
+
+#define VFSOPSF_NOSYNCERTHR	0x00000001
 
 #define VFS_MOUNT(MP, PATH, DATA, CRED)		\
 	vfs_mount(MP, PATH, DATA, CRED)

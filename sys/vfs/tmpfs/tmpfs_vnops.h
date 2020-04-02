@@ -43,6 +43,7 @@
 
 extern struct vop_ops tmpfs_vnode_vops;
 extern struct vop_ops tmpfs_fifo_vops;
+extern int tmpfs_bufcache_mode __read_mostly;
 
 /*
  * Declarations for tmpfs_vnops.c.
@@ -50,6 +51,7 @@ extern struct vop_ops tmpfs_fifo_vops;
 
 int tmpfs_access(struct vop_access_args *);
 int tmpfs_getattr(struct vop_getattr_args *);
+int tmpfs_getattr_quick(struct vop_getattr_args *);
 int tmpfs_setattr(struct vop_setattr_args *);
 int tmpfs_reclaim(struct vop_reclaim_args *);
 

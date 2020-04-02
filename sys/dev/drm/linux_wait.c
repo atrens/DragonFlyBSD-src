@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 François Tigeot <ftigeot@wolfpond.org>
+ * Copyright (c) 2019-2020 François Tigeot <ftigeot@wolfpond.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -58,4 +58,73 @@ __wake_up_core(wait_queue_head_t *q, int num_to_wake_up)
 		if (num_to_wake_up == 0)
 			break;
 	}
+}
+
+void
+__wait_event_prefix(wait_queue_head_t *wq, int flags)
+{
+	lockmgr(&wq->lock, LK_EXCLUSIVE);
+	if (flags & PCATCH) {
+		set_current_state(TASK_INTERRUPTIBLE);
+	} else {
+		set_current_state(TASK_UNINTERRUPTIBLE);
+	}
+	lockmgr(&wq->lock, LK_RELEASE);
+}
+
+void
+prepare_to_wait(wait_queue_head_t *q, wait_queue_t *wait, int state)
+{
+	lockmgr(&q->lock, LK_EXCLUSIVE);
+	if (list_empty(&wait->task_list))
+		__add_wait_queue(q, wait);
+	set_current_state(state);
+	lockmgr(&q->lock, LK_RELEASE);
+}
+
+void
+finish_wait(wait_queue_head_t *q, wait_queue_t *wait)
+{
+	set_current_state(TASK_RUNNING);
+
+	lockmgr(&q->lock, LK_EXCLUSIVE);
+	if (!list_empty(&wait->task_list))
+		list_del_init(&wait->task_list);
+	lockmgr(&q->lock, LK_RELEASE);
+}
+
+void
+wake_up_bit(void *addr, int bit)
+{
+	wakeup_one(addr);
+}
+
+/* Wait for a bit to be cleared or a timeout to expire */
+int
+wait_on_bit_timeout(unsigned long *word, int bit, unsigned mode,
+		    unsigned long timeout)
+{
+	int rv, awakened = 0, timeout_expired = 0;
+	long start_time;
+
+	if (!test_bit(bit, word))
+		return 0;
+
+	start_time = ticks;
+	set_current_state(mode);
+
+	do {
+		rv = tsleep(word, mode, "lwobt", timeout);
+		if (rv == 0)
+			awakened = 1;
+		if (time_after_eq(start_time, timeout))
+			timeout_expired = 1;
+	} while (test_bit(bit, word) && !timeout_expired);
+
+	set_current_state(TASK_RUNNING);
+
+	if (awakened)
+		return 0;
+
+	return 1;
 }

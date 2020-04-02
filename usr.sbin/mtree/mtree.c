@@ -30,10 +30,6 @@
  * SUCH DAMAGE.
  */
 
-#if HAVE_NBTOOL_CONFIG_H
-#include "nbtool_config.h"
-#endif
-
 #include <sys/param.h>
 #include <sys/stat.h>
 
@@ -163,10 +159,14 @@ main(int argc, char **argv)
 			nflag = 1;
 			break;
 		case 'N':
+#ifdef BOOTSTRAPPING
+			mtree_err("The -N is disabled in btools");
+#else
 			if (! setup_getid(optarg))
 				mtree_err(
 			    "Unable to use user and group databases in `%s'",
 				    optarg);
+#endif
 			break;
 		case 'O':
 			load_only(optarg);

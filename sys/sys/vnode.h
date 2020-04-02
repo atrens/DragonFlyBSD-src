@@ -147,15 +147,15 @@ RB_HEAD(buf_rb_tree, buf);
 RB_HEAD(buf_rb_hash, buf);
 
 struct vnode {
-	struct spinlock v_spin;
-	int	v_flag;				/* vnode flags (see below) */
-	int	v_writecount;
-	int	v_opencount;			/* number of explicit opens */
-	int	v_auxrefs;			/* auxiliary references */
-	int	v_refcnt;
+	struct lock	v_lock;			/* file/dir ops lock */
+	struct lwkt_token v_token;		/* (see above) */
+	struct spinlock	v_spin;
 	int	v_pbuf_count;			/* (device nodes only) */
+	int	v_writecount;
 	struct bio_track v_track_read;		/* track I/O's in progress */
 	struct bio_track v_track_write;		/* track I/O's in progress */
+	int	v_opencount;			/* number of explicit opens */
+	int	v_flag;				/* vnode flags (see below) */
 	struct mount *v_mount;			/* ptr to vfs we are in */
 	struct vop_ops **v_ops;			/* vnode operations vector */
 	TAILQ_ENTRY(vnode) v_list;		/* vnode act/inact/cache/free */
@@ -164,7 +164,7 @@ struct vnode {
 	struct buf_rb_tree v_rbclean_tree;	/* RB tree of clean bufs */
 	struct buf_rb_tree v_rbdirty_tree;	/* RB tree of dirty bufs */
 	struct buf_rb_hash v_rbhash_tree;	/* RB tree general lookup */
-	enum	vtype v_type;			/* vnode type */
+	enum vtype	v_type;			/* vnode type */
 	int16_t		v_act;			/* use heuristic */
 	int16_t		v_state;		/* active/free/cached */
 	union {
@@ -180,11 +180,12 @@ struct vnode {
 	off_t	v_filesize;			/* file EOF or NOOFFSET */
 	off_t	v_lazyw;			/* lazy write iterator */
 	struct vm_object *v_object;		/* Place to store VM object */
-	struct	lock v_lock;			/* file/dir ops lock */
-	struct	lwkt_token v_token;		/* (see above) */
 	enum	vtagtype v_tag;			/* type of underlying data */
 	void	*v_data;			/* private data for fs */
 	struct namecache_list v_namecache;	/* (S) associated nc entries */
+	int	v_namecache_count;		/* (S) count of entries */
+	int	v_auxrefs;			/* vhold/vdrop refs */
+	int	v_refcnt;			/* vget/vput refs */
 	struct	{
 		struct	kqinfo vpi_kqinfo;	/* identity of poller(s) */
 	} v_pollinfo;
@@ -348,6 +349,12 @@ extern	int		vttoif_tab[];
 	SYSUNINIT(f##uninit, SI_SUB_VFS, SI_ORDER_SECOND,vfs_nrm_vnodeops_sysinit, &f)
 
 /*
+ * nvextendbuf() flags
+ */
+#define NVEXTF_TRIVIAL	0x0001
+#define NVEXTF_BUWRITE	0x0002
+
+/*
  * Global vnode data.
  */
 struct objcache;
@@ -416,6 +423,7 @@ struct uio;
 struct vattr;
 struct vnode;
 struct syncer_ctx;
+struct vfsops;
 
 struct vnode *getsynthvnode(const char *devname);
 void	addaliasu (struct vnode *vp, int x, int y);
@@ -435,7 +443,6 @@ void	trigger_syncer (struct mount *mp);
 int	vaccess(enum vtype, mode_t, uid_t, gid_t, mode_t, struct ucred *);
 void	vattr_null (struct vattr *vap);
 int	vcount (struct vnode *vp);
-int	vfinddev (cdev_t dev, enum vtype type, struct vnode **vpp);
 void	vfs_nadd_vnodeops_sysinit (void *);
 void	vfs_nrm_vnodeops_sysinit (void *);
 void	vfs_add_vnodeops(struct mount *, struct vop_ops *, struct vop_ops **);
@@ -456,7 +463,6 @@ void	vsetobjdirty(struct vnode *vp);
 
 void	insmntque(struct vnode *vp, struct mount *mp);
 
-void	vclean_vxlocked (struct vnode *vp, int flags);
 void	vclean_unlocked (struct vnode *vp);
 void	vgone_vxlocked (struct vnode *vp);
 int	vrevoke (struct vnode *vp, struct ucred *cred);
@@ -464,10 +470,10 @@ int	vinvalbuf (struct vnode *vp, int save, int slpflag, int slptimeo);
 int	vtruncbuf (struct vnode *vp, off_t length, int blksize);
 void	vnode_pager_setsize (struct vnode *, vm_ooffset_t);
 int	nvtruncbuf (struct vnode *vp, off_t length, int blksize, int boff,
-		int trivial);
+		int flags);
 int	nvextendbuf(struct vnode *vp, off_t olength, off_t nlength,
 		int oblksize, int nblksize,
-		int oboff, int nboff, int trivial);
+		int oboff, int nboff, int flags);
 void	nvnode_pager_setsize (struct vnode *vp, off_t length,
 		int blksize, int boff);
 int	vfsync(struct vnode *vp, int waitfor, int passes,
@@ -487,6 +493,7 @@ int	vn_islocked_unlock (struct vnode *vp);
 void	vn_islocked_relock (struct vnode *vp, int vpls);
 int	vn_lock (struct vnode *vp, int flags);
 void	vn_unlock (struct vnode *vp);
+int	vn_relock (struct vnode *vp, int flags);
 
 /*#define DEBUG_VN_UNLOCK*/
 #ifdef DEBUG_VN_UNLOCK
@@ -512,10 +519,11 @@ void	vfs_timestamp (struct timespec *);
 size_t	vfs_flagstostr(int flags, const struct mountctl_opt *optp, char *buf, size_t len, int *errorp);
 void	vn_mark_atime(struct vnode *vp, struct thread *td);
 int	vfs_inodehashsize(void);
-int	vn_writechk (struct vnode *vp, struct nchandle *nch);
+int	vn_writechk (struct vnode *vp);
 int	ncp_writechk(struct nchandle *nch);
 int	vop_stdopen (struct vop_open_args *ap);
 int	vop_stdclose (struct vop_close_args *ap);
+int	vop_stdgetattr_quick (struct vop_getattr_args *ap);
 int	vop_stdmountctl(struct vop_mountctl_args *ap);
 int	vop_stdgetpages(struct vop_getpages_args *ap);
 int	vop_stdputpages(struct vop_putpages_args *ap);
@@ -544,6 +552,7 @@ int	vop_compat_nremove(struct vop_nremove_args *ap);
 int	vop_compat_nrmdir(struct vop_nrmdir_args *ap);
 int	vop_compat_nrename(struct vop_nrename_args *ap);
 
+void	vx_downgrade (struct vnode *vp);
 void	vx_lock (struct vnode *vp);
 void	vx_unlock (struct vnode *vp);
 void	vx_get (struct vnode *vp);
@@ -554,6 +563,7 @@ void	vput (struct vnode *vp);
 void	vhold (struct vnode *);
 void	vdrop (struct vnode *);
 void	vref (struct vnode *vp);
+void	vref_special (struct vnode *vp);
 void	vrele (struct vnode *vp);
 void	vsetflags (struct vnode *vp, int flags);
 void	vclrflags (struct vnode *vp, int flags);
@@ -567,7 +577,7 @@ void	debug_vput (struct vnode *vp, const char *filename, int line);
 void	vfs_subr_init(void);
 void	vfs_mount_init(void);
 void	vfs_lock_init(void);
-void	mount_init(struct mount *mp);
+void	mount_init(struct mount *mp, struct vfsops *ops);
 void	synchronizevnodecount(void);
 int	countcachedvnodes(void);
 int	countcachedandinactivevnodes(void);

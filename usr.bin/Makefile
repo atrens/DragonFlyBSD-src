@@ -60,6 +60,7 @@ SUBDIR=	alias \
 	file2c \
 	find \
 	finger \
+	flame_graph \
 	flex \
 	fmt \
 	fold \
@@ -181,6 +182,7 @@ SUBDIR=	alias \
 	ssh \
 	ssh-add \
 	ssh-agent \
+	ssh-copy-id \
 	ssh-keygen \
 	ssh-keyscan \
 	stat \

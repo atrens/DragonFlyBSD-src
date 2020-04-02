@@ -30,17 +30,10 @@
  * SUCH DAMAGE.
  */
 
-#if HAVE_NBTOOL_CONFIG_H
-#include "nbtool_config.h"
-#endif
-
 #include <sys/param.h>
 #include <sys/stat.h>
 
-#if ! HAVE_NBTOOL_CONFIG_H
 #include <dirent.h>
-#endif
-
 #include <errno.h>
 #include <fnmatch.h>
 #include <stdio.h>
@@ -170,7 +163,9 @@ miss(NODE *p, char *tail)
 	int create;
 	char *tp;
 	const char *type;
+#if HAVE_STRUCT_STAT_ST_FLAGS
 	u_int32_t flags;
+#endif
 
 	for (; p; p = p->next) {
 		if (p->flags & F_OPT && !(p->flags & F_VISIT))

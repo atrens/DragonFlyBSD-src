@@ -652,6 +652,8 @@ extern struct lwkt_token nfs_token;
 u_quad_t nfs_curusec (void);
 int	nfs_init (struct vfsconf *vfsp);
 int	nfs_uninit (struct vfsconf *vfsp);
+struct ucred *nfs_crhold(struct ucred *cred);
+int	nfs_crsame(struct ucred *cr1, struct ucred *cr2);
 int	nfs_reply (struct nfsmount *nmp, struct nfsreq *);
 int	nfs_getreq (struct nfsrv_descript *,struct nfsd *,int);
 int	nfs_send (struct socket *, struct sockaddr *, struct mbuf *, 
@@ -789,7 +791,7 @@ void	nfsrv_rcv_upcall (struct socket *so, void *arg, int waitflag);
 void	nfsrv_slpderef (struct nfssvc_sock *slp);
 void	nfsrv_slpref (struct nfssvc_sock *slp);
 int	nfs_meta_setsize (struct vnode *vp, struct thread *td,
-			off_t nbase, int trivial);
+			off_t nbase, int nvextflags);
 int	nfs_clientd(struct nfsmount *nmp, struct ucred *cred,
 			struct nfsd_cargs *ncd, int flag, caddr_t argp,
 			struct thread *td);

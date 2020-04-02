@@ -34,19 +34,49 @@
 #include <sys/module.h>
 #include <sys/bus.h>
 #include <sys/random.h>
+#include <sys/malloc.h>
 #include <sys/sysctl.h>
 
 #include <machine/specialreg.h>
 
+/*
+ * WARNING!
+ *
+ * The RDRAND instruction is a very slow instruction, burning approximately
+ * 0.79uS per 64-bit word on a modern ryzen cpu.  Intel cpu's run this
+ * instruction far more quickly.  The quality of the results are unknown
+ * either way.
+ *
+ * However, possibly an even bigger problem is the cost of calling
+ * add_buffer_randomness(), which takes an enormous amount of time
+ * when handed a large buffer.
+ *
+ * Our code harvests at a 10hz rate on every single core, and also chains
+ * some entropy from core to core so honestly it doesn't take much to really
+ * mix things up.  Use a decent size (16 or 32 bytes should be good).
+ *
+ * On a TR3990 going from 512 to 16 gave userland almost 10% additional
+ * performance... a very stark difference.  A simple test loop:
+ *
+ * BEFORE: (RDRAND_SIZE 512)
+ *	7.258u 0.000s 0:07.69 94.2%     2+70k 2+0io 0pf+0w
+ *	7.222u 0.000s 0:07.67 94.1%     2+70k 0+0io 0pf+0w
+ *	7.239u 0.000s 0:07.69 94.0%     2+70k 0+0io 0pf+0w
+ *
+ * AFTER: (RDRAND_SIZE 16)		(9.3% faster)
+ *	7.019u 0.000s 0:07.02 99.8%     2+66k 0+0io 0pf+0w
+ *	7.019u 0.000s 0:07.02 99.8%     2+66k 0+0io 0pf+0w
+ *	7.028u 0.000s 0:07.02 100.0%    2+66k 0+0io 0pf+0w
+ */
 #define	RDRAND_ALIGN(p)	(void *)(roundup2((uintptr_t)(p), 16))
-#define RDRAND_SIZE	512
+#define RDRAND_SIZE	16
 
 static int rdrand_debug;
 SYSCTL_INT(_debug, OID_AUTO, rdrand, CTLFLAG_RW, &rdrand_debug, 0,
 	   "Enable rdrand debugging");
 
 struct rdrand_softc {
-	struct callout	sc_rng_co;
+	struct callout	*sc_rng_co;
 	int32_t		sc_rng_ticks;
 };
 
@@ -84,6 +114,7 @@ static int
 rdrand_attach(device_t dev)
 {
 	struct rdrand_softc *sc;
+	int i;
 
 	sc = device_get_softc(dev);
 
@@ -92,9 +123,18 @@ rdrand_attach(device_t dev)
 	else
 		sc->sc_rng_ticks = 1;
 
-	callout_init_mp(&sc->sc_rng_co);
-	callout_reset(&sc->sc_rng_co, sc->sc_rng_ticks,
-		      rdrand_rng_harvest, sc);
+	sc->sc_rng_co = kmalloc(ncpus * sizeof(*sc->sc_rng_co),
+				M_TEMP, M_WAITOK | M_ZERO);
+
+	/*
+	 * Set an initial offset so we don't pound all cores simultaneously
+	 * for no good reason.
+	 */
+	for (i = 0; i < ncpus; ++i) {
+		callout_init_mp(&sc->sc_rng_co[i]);
+		callout_reset_bycpu(&sc->sc_rng_co[i],
+				    i, rdrand_rng_harvest, sc, i);
+	}
 
 	return 0;
 }
@@ -104,10 +144,13 @@ static int
 rdrand_detach(device_t dev)
 {
 	struct rdrand_softc *sc;
+	int i;
 
 	sc = device_get_softc(dev);
 
-	callout_terminate(&sc->sc_rng_co);
+	for (i = 0; i < ncpus; ++i) {
+		callout_terminate(&sc->sc_rng_co[i]);
+	}
 
 	return (0);
 }
@@ -125,11 +168,14 @@ rdrand_rng_harvest(void *arg)
 
 	cnt = rdrand_rng(arandomness, RDRAND_SIZE);
 	if (cnt > 0 && cnt < sizeof(randomness)) {
-		add_buffer_randomness_src(arandomness, cnt, RAND_SRC_RDRAND);
+		add_buffer_randomness_src(arandomness, cnt,
+					  RAND_SRC_RDRAND |
+					  RAND_SRCF_PCPU);
 
-		if (rdrand_debug) {
-			kprintf("rdrand(%d): %02x %02x %02x %02x...\n",
-				cnt,
+		if (rdrand_debug > 0) {
+			--rdrand_debug;
+			kprintf("rdrand(%d,cpu=%d): %02x %02x %02x %02x...\n",
+				cnt, mycpu->gd_cpuid,
 				arandomness[0],
 				arandomness[1],
 				arandomness[2],
@@ -137,7 +183,7 @@ rdrand_rng_harvest(void *arg)
 		}
 	}
 
-	callout_reset(&sc->sc_rng_co, sc->sc_rng_ticks,
+	callout_reset(&sc->sc_rng_co[mycpu->gd_cpuid], sc->sc_rng_ticks,
 		      rdrand_rng_harvest, sc);
 }
 

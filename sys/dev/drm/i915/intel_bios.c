@@ -71,7 +71,7 @@ static u32 _get_blocksize(const u8 *block_base)
 /* Get BDB block size give a pointer to data after Block ID and Block Size. */
 static u32 get_blocksize(const void *block_data)
 {
-	return _get_blocksize((const char*)block_data - 3);
+	return _get_blocksize(block_data - 3);
 }
 
 static const void *
@@ -170,9 +170,9 @@ get_lvds_dvo_timing(const struct bdb_lvds_lfp_data *lvds_lfp_data,
 	int dvo_timing_offset =
 		lvds_lfp_data_ptrs->ptr[0].dvo_timing_offset -
 		lvds_lfp_data_ptrs->ptr[0].fp_timing_offset;
-	const char *entry = (const char *)lvds_lfp_data->data + lfp_data_size * index;
+	char *entry = (char *)lvds_lfp_data->data + lfp_data_size * index;
 
-	return (const struct lvds_dvo_timing *)(entry + dvo_timing_offset);
+	return (struct lvds_dvo_timing *)(entry + dvo_timing_offset);
 }
 
 /* get lvds_fp_timing entry
@@ -218,7 +218,7 @@ parse_lfp_panel_data(struct drm_i915_private *dev_priv,
 
 	dev_priv->vbt.lvds_dither = lvds_options->pixel_dither;
 
-	ret = intel_opregion_get_panel_type(dev_priv->dev);
+	ret = intel_opregion_get_panel_type(dev_priv);
 	if (ret >= 0) {
 		WARN_ON(ret > 0xf);
 		panel_type = ret;
@@ -321,6 +321,15 @@ parse_lfp_backlight(struct drm_i915_private *dev_priv,
 		DRM_DEBUG_KMS("PWM backlight not present in VBT (type %u)\n",
 			      entry->type);
 		return;
+	}
+
+	dev_priv->vbt.backlight.type = INTEL_BACKLIGHT_DISPLAY_DDI;
+	if (bdb->version >= 191 &&
+	    get_blocksize(backlight_data) >= sizeof(*backlight_data)) {
+		const struct bdb_lfp_backlight_control_method *method;
+
+		method = &backlight_data->backlight_control[panel_type];
+		dev_priv->vbt.backlight.type = method->type;
 	}
 
 	dev_priv->vbt.backlight.pwm_freq_hz = entry->pwm_freq_hz;
@@ -768,6 +777,16 @@ parse_mipi_config(struct drm_i915_private *dev_priv,
 		return;
 	}
 
+	/*
+	 * These fields are introduced from the VBT version 197 onwards,
+	 * so making sure that these bits are set zero in the previous
+	 * versions.
+	 */
+	if (dev_priv->vbt.dsi.config->dual_link && bdb->version < 197) {
+		dev_priv->vbt.dsi.config->dl_dcs_cabc_ports = 0;
+		dev_priv->vbt.dsi.config->dl_dcs_backlight_ports = 0;
+	}
+
 	/* We have mandatory mipi config blocks. Initialize as generic panel */
 	dev_priv->vbt.dsi.panel_id = MIPI_DSI_GENERIC_PANEL_ID;
 }
@@ -976,6 +995,10 @@ parse_mipi_sequence(struct drm_i915_private *dev_priv,
 			DRM_ERROR("Unknown sequence %u\n", seq_id);
 			goto err;
 		}
+
+		/* Log about presence of sequences we won't run. */
+		if (seq_id == MIPI_SEQ_TEAR_ON || seq_id == MIPI_SEQ_TEAR_OFF)
+			DRM_DEBUG_KMS("Unsupported sequence %u\n", seq_id);
 
 		dev_priv->vbt.dsi.sequence[seq_id] = data + index;
 
@@ -1326,9 +1349,9 @@ init_vbt_defaults(struct drm_i915_private *dev_priv)
 
 static const struct bdb_header *get_bdb_header(const struct vbt_header *vbt)
 {
-	const char *_vbt = (const char *)vbt;
+	const void *_vbt = vbt;
 
-	return (const struct bdb_header *)(_vbt + vbt->bdb_offset);
+	return _vbt + vbt->bdb_offset;
 }
 
 /**
@@ -1385,7 +1408,7 @@ static const struct vbt_header *find_vbt(void __iomem *bios, size_t size)
 		 * This is the one place where we explicitly discard the address
 		 * space (__iomem) of the BIOS/VBT.
 		 */
-		vbt = (char __force *) bios + i;
+		vbt = (void __force *) bios + i;
 		if (intel_bios_is_valid_vbt(vbt, size - i))
 			return vbt;
 
@@ -1407,9 +1430,7 @@ static const struct vbt_header *find_vbt(void __iomem *bios, size_t size)
 int
 intel_bios_init(struct drm_i915_private *dev_priv)
 {
-#if 0
-	struct pci_dev *pdev = dev_priv->dev->pdev;
-#endif
+	struct pci_dev *pdev = dev_priv->drm.pdev;
 	const struct vbt_header *vbt = dev_priv->opregion.vbt;
 	const struct bdb_header *bdb;
 	u8 __iomem *bios = NULL;
@@ -1422,17 +1443,13 @@ intel_bios_init(struct drm_i915_private *dev_priv)
 	if (!vbt) {
 		size_t size;
 
-#if 0
 		bios = pci_map_rom(pdev, &size);
 		if (!bios)
-#endif
 			return -1;
 
 		vbt = find_vbt(bios, size);
 		if (!vbt) {
-#if 0
 			pci_unmap_rom(pdev, bios);
-#endif
 			return -1;
 		}
 
@@ -1459,10 +1476,8 @@ intel_bios_init(struct drm_i915_private *dev_priv)
 	parse_mipi_sequence(dev_priv, bdb);
 	parse_ddi_ports(dev_priv, bdb);
 
-#if 0
 	if (bios)
 		pci_unmap_rom(pdev, bios);
-#endif
 
 	return 0;
 }
@@ -1739,6 +1754,55 @@ intel_bios_is_port_hpd_inverted(struct drm_i915_private *dev_priv,
 		case DVO_PORT_DPC:
 		case DVO_PORT_HDMIC:
 			if (port == PORT_C)
+				return true;
+			break;
+		default:
+			break;
+		}
+	}
+
+	return false;
+}
+
+/**
+ * intel_bios_is_lspcon_present - if LSPCON is attached on %port
+ * @dev_priv:	i915 device instance
+ * @port:	port to check
+ *
+ * Return true if LSPCON is present on this port
+ */
+bool
+intel_bios_is_lspcon_present(struct drm_i915_private *dev_priv,
+				enum port port)
+{
+	int i;
+
+	if (!HAS_LSPCON(dev_priv))
+		return false;
+
+	for (i = 0; i < dev_priv->vbt.child_dev_num; i++) {
+		if (!dev_priv->vbt.child_dev[i].common.lspcon)
+			continue;
+
+		switch (dev_priv->vbt.child_dev[i].common.dvo_port) {
+		case DVO_PORT_DPA:
+		case DVO_PORT_HDMIA:
+			if (port == PORT_A)
+				return true;
+			break;
+		case DVO_PORT_DPB:
+		case DVO_PORT_HDMIB:
+			if (port == PORT_B)
+				return true;
+			break;
+		case DVO_PORT_DPC:
+		case DVO_PORT_HDMIC:
+			if (port == PORT_C)
+				return true;
+			break;
+		case DVO_PORT_DPD:
+		case DVO_PORT_HDMID:
+			if (port == PORT_D)
 				return true;
 			break;
 		default:

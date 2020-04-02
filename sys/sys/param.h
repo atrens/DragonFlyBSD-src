@@ -213,9 +213,12 @@
  * 500707 - libradius/libtacplus removal
  * 500708 - Handle SIOCSIFMTU directly in tap(4) to support MTU > 1500
  * 500709 - Implement lwp_getname() and signal safety
+ * 500710 - Implement getrandom() and __realpath() system calls
+ * 500800 - 5.8 release
+ * 500900 - 5.9 development
  */
 #undef __DragonFly_version
-#define __DragonFly_version 500709	/* propagated to newvers */
+#define __DragonFly_version 500900	/* propagated to newvers */
 
 #include <sys/_null.h>
 
@@ -287,7 +290,7 @@
 
 #define CMASK	022		/* default file mask: S_IWGRP|S_IWOTH */
 #if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
-#define NOUDEV	(udev_t)(-1)	/* non-existent device */
+#define NOUDEV	(dev_t)(-1)	/* non-existent device */
 #define NOMAJ	256		/* non-existent device */
 #endif
 

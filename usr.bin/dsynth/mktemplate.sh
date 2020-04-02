@@ -22,6 +22,7 @@ endif
 
 set sysbase = $argv[1]
 set template = $argv[2]
+set nonomatch
 
 echo "Creating template from $sysbase to $template"
 
@@ -35,10 +36,24 @@ foreach i ( `(cd $sysbase; find /var -type d)` )
 	mkdir -p $template/$i
 end
 
+mkdir -p $template/var/mail
+chown root:mail $template/var/mail
+chmod 775 $template/var/mail
+
+mkdir -p $template/var/games
+chown root:games $template/var/games
+chmod 775 $template/var/games
+
+mkdir -p $template/var/msgs
+chown daemon:wheel $template/var/msgs
+
 # Delete sensitive data from /etc
 #
+# Delete timezone translation so all packages are built in
+# GMT.  Fixes at least one package build.
 #
 rm -f $template/etc/ssh/*key*
+rm -f $template/etc/localtime
 
 if ( -f $template/etc/master.passwd ) then
 	cat $sysbase/etc/master.passwd | \

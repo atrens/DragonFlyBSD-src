@@ -89,6 +89,7 @@ static MALLOC_DEFINE(M_EXT2NODE, "EXT2 node", "EXT2 vnode private part");
 MALLOC_DEFINE(M_EXT2MNT, "EXT2 mount", "EXT2 mount structure");
 
 static struct vfsops ext2fs_vfsops = {
+	.vfs_flags =		0,
 	.vfs_mount =    	ext2_mount,
 	.vfs_unmount =   	ext2_unmount,
 	.vfs_root =     	ext2_root,	/* root inode via vget */
@@ -765,7 +766,7 @@ ext2_mountfs(struct vnode *devvp, struct mount *mp, struct ucred *cred)
 		fs->s_es->s_state &= ~EXT2_VALID_FS;	/* set fs invalid */
 	}
 	mp->mnt_data = (qaddr_t)ump;
-	mp->mnt_stat.f_fsid.val[0] = dev2udev(dev);
+	mp->mnt_stat.f_fsid.val[0] = devid_from_dev(dev);
 	mp->mnt_stat.f_fsid.val[1] = mp->mnt_vfc->vfc_typenum;
 	mp->mnt_maxsymlinklen = EXT2_MAXSYMLINKLEN;
 	mp->mnt_flag |= MNT_LOCAL;
@@ -1116,7 +1117,9 @@ kprintf("ext2_vget(%d) dbn= %d ", ino, fsbtodb(fs, ino_to_fsba(fs, ino)));
 	/*
 	 * Return the locked and refd vnode.
 	 */
+	vx_downgrade(vp);	/* downgrade VX lock to VN lock */
 	*vpp = vp;
+
 	return (0);
 }
 

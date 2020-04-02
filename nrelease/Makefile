@@ -18,7 +18,7 @@ ISODIR?=	/usr/obj/release
 ISOROOT?=	${ISODIR}/root
 GITURL_SRC?=	git://git.dragonflybsd.org/dragonfly.git
 GITURL_DPORTS?=	git://mirror-master.dragonflybsd.org/dports.git
-MAKE_JOBS?=	$$(sysctl -n hw.ncpu)
+NREL_MAKE_JOBS?= $$(sysctl -n hw.ncpu)
 .if !defined(NOFSCHG)
 MTREE_FSCHG=	-i
 .endif
@@ -157,13 +157,13 @@ check:
 buildworld1 buildworld2:
 	( cd ${SRCDIR}; \
 		${WORLD_CCVER:C/^..*$/WORLD_CCVER=/}${WORLD_CCVER} \
-			make -j ${MAKE_JOBS} -DWANT_INSTALLER \
+			make -j ${NREL_MAKE_JOBS} -DWANT_INSTALLER \
 			${.TARGET:C/build(.*)2/quick\1/:C/1//} )
 
 buildkernel1 buildkernel2:
 	( cd ${SRCDIR}; \
 		${WORLD_CCVER:C/^..*$/WORLD_CCVER=/}${WORLD_CCVER} \
-			make -j ${MAKE_JOBS} \
+			make -j ${NREL_MAKE_JOBS} \
 			${.TARGET:C/build(.*)2/quick\1/:C/1//} )
 
 # Unconditionally clean out ${ISOROOT} so a previous img build
@@ -208,7 +208,8 @@ srcs:
 .else
 	( cd ${SRCDIR} && \
 		tar --exclude .git -s '/^\./src/' -cf - \
-			./Makefile ./Makefile.inc1 ./sys | \
+			./Makefile ./Makefile.inc1 ./sys \
+			./share/syscons/fonts | \
 			bzip2 -9 > ${ISOROOT}/usr/src-sys.tar.bz2 )
 .endif
 .endif
@@ -316,7 +317,7 @@ mkiso:
 	newfs_msdos -C 400k -F 12 -L EFI -m 0xf8 ${ISOROOT}/boot/efiboot.img
 	vnconfig -l | grep "not in use" | head -n 1 | 			\
 	    cut -f 1 -d: > ${ISODIR}/vn.which
-	vnconfig -e -s labels `cat ${ISODIR}/vn.which` ${ISOROOT}/boot/efiboot.img
+	vnconfig -e `cat ${ISODIR}/vn.which` ${ISOROOT}/boot/efiboot.img
 	mount_msdos /dev/`cat ${ISODIR}/vn.which` ${IMGMNT}
 	mkdir -p ${IMGMNT}/EFI/BOOT
 	cp ${ISOROOT}/boot/loader.efi ${IMGMNT}/EFI/BOOT/BOOTX64.EFI
@@ -349,14 +350,14 @@ mkimg:
 	@echo "STEP: determine free vn device"
 	vnconfig -l | grep "not in use" | head -n 1 | 			\
 	    cut -f 1 -d: > ${ISODIR}/vn.which
-	vnconfig -e -s labels `cat ${ISODIR}/vn.which` ${IMGFILE}
+	vnconfig -e `cat ${ISODIR}/vn.which` ${IMGFILE}
 	@echo "STEP: set up legacy MBR"
 	fdisk -b ${ISOROOT}/boot/mbr -IB `cat ${ISODIR}/vn.which`
 	fdisk -s `cat ${ISODIR}/vn.which` >${ISODIR}/fdisk.dat
 	awk '(NR==1){printf("g c%s h%s s%s\n", $$2, $$4, $$6);}' \
 	    ${ISODIR}/fdisk.dat >${ISODIR}/fdisk.conf
 	echo "p 1 239 63 257985" >>${ISODIR}/fdisk.conf
-	awk '($$1=="1:"){printf("p 2 165 258048 %lu\n", $$3 - 258528);}' \
+	awk '($$1=="1:"){printf("p 2 108 258048 %lu\n", $$3 - 258528);}' \
 	    ${ISODIR}/fdisk.dat >>${ISODIR}/fdisk.conf
 	echo "a 2" >>${ISODIR}/fdisk.conf
 	fdisk -iv -f ${ISODIR}/fdisk.conf `cat ${ISODIR}/vn.which`
@@ -436,7 +437,7 @@ help all:
 	@echo "  GITURL_SRC: override the Git URL to source repository"
 	@echo "  GITURL_DPORTS: override the Git URL to dports repository"
 	@echo "  IMGSIZE: override the size of .img (in 512-byte sectors)"
-	@echo "  MAKE_JOBS: override the default value (sysctl hw.ncpu)"
+	@echo "  NREL_MAKE_JOBS: override the default value (sysctl hw.ncpu)"
 	@echo "  PKG_<port>: specify the package name for port <port>"
 	@echo "  WITHOUT_SRCS: do not package source code if set"
 	@echo ""

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2019 François Tigeot <ftigeot@wolfpond.org>
+ * Copyright (c) 2014-2020 François Tigeot <ftigeot@wolfpond.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -33,7 +33,9 @@
 #include <linux/compiler.h>
 #include <linux/types.h>
 #include <linux/mutex.h>
+#include <linux/pm.h>
 #include <linux/atomic.h>
+#include <linux/ratelimit.h>
 #include <linux/gfp.h>
 
 #include <sys/bus.h>
@@ -44,6 +46,8 @@ struct device {
 	struct kobject kobj;
 
 	device_t	bsddev;
+
+	void		*driver_data;	/* for dev_set and get_drvdata */
 };
 
 struct device_driver {
@@ -62,6 +66,8 @@ struct device_node;
 	device_printf((dev)->bsddev, "info: " fmt, ## __VA_ARGS__)
 #define	dev_printk(level, dev, fmt, ...)				\
 	device_printf((dev)->bsddev, "%s: " fmt, level, ## __VA_ARGS__)
+#define dev_notice(dev, fmt, ...)					\
+	device_printf((dev)->bsddev, fmt, ##__VA_ARGS__)
 
 static inline const char *
 dev_name(const struct device *dev)
@@ -69,10 +75,16 @@ dev_name(const struct device *dev)
 	return("dev_name");
 }
 
+static inline void
+dev_set_drvdata(struct device *dev, void *data)
+{
+	dev->driver_data = data;
+}
+
 static inline void *
 dev_get_drvdata(const struct device *dev)
 {
-	return device_get_softc(dev->bsddev);
+	return dev->driver_data;
 }
 
 static inline int

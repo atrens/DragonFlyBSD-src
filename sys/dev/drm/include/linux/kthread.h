@@ -30,9 +30,11 @@
 #include <linux/err.h>
 #include <linux/sched.h>
 
-#include <sys/kthread.h>
+struct task_struct *
+kthread_run(int (*fn)(void *lfnarg), void *data, const char *namefmt, ...);
 
-/* From OpenBSD */
-#define kthread_should_stop()	0
+int kthread_stop(struct task_struct *k);
+
+bool kthread_should_stop(void);
 
 #endif	/* _LINUX_KTHREAD_H_ */

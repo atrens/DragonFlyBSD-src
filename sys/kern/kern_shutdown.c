@@ -133,14 +133,14 @@ SYSCTL_NODE(_kern, OID_AUTO, shutdown, CTLFLAG_RW, 0, "Shutdown environment");
  */
 const char *panicstr;
 
-int dumping;				/* system is dumping */
+__read_mostly int dumping;		/* system is dumping */
 static struct dumperinfo dumper;	/* selected dumper */
 
 __read_frequently globaldata_t panic_cpu_gd;	/* used in lock assertion */
 struct lwkt_tokref panic_tokens[LWKT_MAXTOKENS];
 int panic_tokens_count;
 
-int bootverbose = 0;			/* note: assignment to force non-bss */
+__read_mostly int bootverbose = 0;	/* note: assignment to force non-bss */
 SYSCTL_INT(_debug, OID_AUTO, bootverbose, CTLFLAG_RW,
 	   &bootverbose, 0, "Verbose kernel messages");
 
@@ -498,6 +498,7 @@ shutdown_halt(void *junk, int howto)
 		cpu_halt();
 #else
 		kprintf("Please press any key to reboot.\n\n");
+		cnpoll(TRUE);
 		switch (cngetc()) {
 		case -1:		/* No console, just die */
 			cpu_halt();
@@ -715,12 +716,12 @@ static int
 sysctl_kern_dumpdev(SYSCTL_HANDLER_ARGS)
 {
 	int error;
-	udev_t ndumpdev;
+	dev_t ndumpdev;
 
-	ndumpdev = dev2udev(dumpdev);
+	ndumpdev = devid_from_dev(dumpdev);
 	error = sysctl_handle_opaque(oidp, &ndumpdev, sizeof ndumpdev, req);
 	if (error == 0 && req->newptr != NULL)
-		error = setdumpdev(udev2dev(ndumpdev, 0));
+		error = setdumpdev(dev_from_devid(ndumpdev, 0));
 	return (error);
 }
 
@@ -982,7 +983,7 @@ dumpsys(void)
 	}
 }
 
-int dump_stop_usertds = 0;
+__read_frequently int dump_stop_usertds = 0;
 
 static
 void

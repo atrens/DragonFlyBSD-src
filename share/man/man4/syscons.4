@@ -26,7 +26,7 @@
 .\"
 .\" $FreeBSD: src/share/man/man4/syscons.4,v 1.10.2.14 2003/04/25 21:21:36 brueffer Exp $
 .\"
-.Dd June 4, 2018
+.Dd February 24, 2020
 .Dt SYSCONS 4
 .Os
 .Sh NAME
@@ -277,6 +277,13 @@ tries to find a more or less pleasant looking default.
 Setting
 .Va kern.kms_columns
 to a negative value turns off scaling.
+Please note that
+.Pa ttyv0
+is restricted to 160 columns and any setting of
+.Va kern.kms_columns
+resulting in a higher number of columns will be ignored for
+.Pa ttyv0 ,
+but applied to other virtual terminals.
 .El
 .Ss Sysctl Variables
 The following
@@ -416,13 +423,7 @@ option too.
 The following driver flags can be used to control the
 .Nm
 driver.
-They can be set either in the kernel configuration file
-(see
-.Xr config 8 ) ,
-or else in the User Configuration Menu at boot
-time
-(see
-.Xr boot 8 ) .
+They can be set in the kernel configuration file.
 .Bl -tag -width bit_0
 .\".It bit 0 (VISUAL_BELL)
 .\"Uses the ``visual'' bell.
@@ -826,7 +827,6 @@ input queue - usually 1024 bytes
 .Xr kbdmap 5 ,
 .Xr rc.conf 5 ,
 .Xr ttys 5 ,
-.Xr config 8 ,
 .Xr getty 8 ,
 .Xr kldload 8 ,
 .Xr moused 8

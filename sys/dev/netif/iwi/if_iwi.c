@@ -43,13 +43,11 @@
 #include <sys/systm.h>
 #include <sys/malloc.h>
 #include <sys/lock.h>
-#include <sys/mutex.h>
 #include <sys/module.h>
 #include <sys/bus.h>
 #include <sys/endian.h>
 #include <sys/proc.h>
 #include <sys/mount.h>
-#include <sys/namei.h>
 #include <sys/linker.h>
 #include <sys/firmware.h>
 #include <sys/taskqueue.h>

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015-2019 François Tigeot <ftigeot@wolfpond.org>
+ * Copyright (c) 2015-2020 François Tigeot <ftigeot@wolfpond.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -27,6 +27,7 @@
 #ifndef _LINUX_FB_H_
 #define _LINUX_FB_H_
 
+#include <linux/kgdb.h>
 #include <uapi/linux/fb.h>
 
 #include <linux/fs.h>
@@ -38,6 +39,8 @@
 #include <asm/io.h>
 
 #include <machine/framebuffer.h>
+
+struct videomode;
 
 #define	KHZ2PICOS(a)	(1000000000UL/(a))
 
@@ -59,5 +62,8 @@ extern int fb_get_options(const char *name, char **option);
 #define FBINFO_STATE_RUNNING	0
 
 struct device_node;
+
+struct fb_info * framebuffer_alloc(size_t size, struct device *dev);
+void framebuffer_release(struct fb_info *info);
 
 #endif	/* _LINUX_FB_H_ */

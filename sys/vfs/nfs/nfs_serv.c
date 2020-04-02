@@ -1600,7 +1600,7 @@ nfsrv_create(struct nfsrv_descript *nfsd, struct nfssvc_sock *slp,
 	u_int32_t *tl;
 	struct nlookupdata nd;
 	int error = 0, len, tsize, dirfor_ret = 1, diraft_ret = 1;
-	udev_t rdev = NOUDEV;
+	dev_t rdev = NOUDEV;
 	caddr_t cp;
 	int how, exclusive_flag = 0;
 	struct vnode *dirp;
@@ -3966,7 +3966,8 @@ nfsmout:
 /*
  * Perform access checking for vnodes obtained from file handles that would
  * refer to files already opened by a Unix client. You cannot just use
- * vn_writechk() and VOP_ACCESS() for two reasons.
+ * vn_writechk() and VOP_ACCESS() for two reasons:
+ *
  * 1 - You must check for exported rdonly as well as MNT_RDONLY for the write case
  * 2 - The owner is to be given access irrespective of mode bits for some
  *     operations, so that processes that chmod after opening a file don't

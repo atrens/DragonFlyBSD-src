@@ -44,7 +44,6 @@
 #include <sys/proc.h>
 #include <sys/malloc.h>
 #include <sys/lock.h>
-#include <sys/mutex.h>
 #include <sys/conf.h>
 
 #include <sys/kernel.h>
@@ -52,7 +51,6 @@
 #include <sys/kthread.h>
 #include <sys/bus.h>
 #include <sys/rman.h>
-#include <sys/mplock2.h>
 
 #include <net/if.h>
 #include <net/if_arp.h>

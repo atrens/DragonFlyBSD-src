@@ -260,9 +260,43 @@ sessinsertinit(struct session *sess)
  * The kernel waits for the hold count to drop to 0 (or 1 in some cases) at
  * various critical points in the fork/exec and exit paths before proceeding.
  */
-#define PLOCK_ZOMB	0x20000000
-#define PLOCK_WAITING	0x40000000
-#define PLOCK_MASK	0x1FFFFFFF
+#define PLOCK_WAITING	0x40000000	/* tsleep() on p_lock */
+#define PLOCK_ZOMB	0x20000000	/* zombie interlock held */
+#define PLOCK_WAITRES	0x10000000	/* wait reservation held */
+#define PLOCK_MASK	0x0FFFFFFF
+
+/*
+ * Returns non-zero if the WAITRES flag has been set
+ */
+int
+pwaitres_pending(struct proc *p)
+{
+	if (p->p_lock & PLOCK_WAITRES)
+		return 1;
+	return 0;
+}
+
+/*
+ * Caller holds PLOCK_ZOMB.  Sets PLOCK_WAITRES and wakes up anyone in
+ * pholdzomb() (which will fail).
+ */
+void
+pwaitres_set(struct proc *p)
+{
+	int o;
+
+	KKASSERT((p->p_lock & (PLOCK_ZOMB | PLOCK_WAITRES)) == PLOCK_ZOMB);
+	o = p->p_lock;
+	cpu_ccfence();
+	for (;;) {
+		if (atomic_fcmpset_int(&p->p_lock, &o,
+				       (o | PLOCK_WAITRES) & ~PLOCK_WAITING)) {
+			if (o & PLOCK_WAITING)
+				wakeup(&p->p_lock);
+			return;
+		}
+	}
+}
 
 void
 pstall(struct proc *p, const char *wmesg, int count)
@@ -340,7 +374,8 @@ prele(struct proc *p)
 }
 
 /*
- * Hold and flag serialized for zombie reaping purposes.
+ * Hold and flag serialized for zombie reaping purposes.  Fail if we had
+ * to sleep or if another thread has reserved the reap (WAITRES).
  *
  * This function will fail if it has to block, returning non-zero with
  * neither the flag set or the hold count bumped.  Note that (p) may
@@ -372,10 +407,12 @@ pholdzomb(struct proc *p)
 	for (;;) {
 		o = p->p_lock;
 		cpu_ccfence();
-		if ((o & PLOCK_ZOMB) == 0) {
+		if ((o & (PLOCK_ZOMB | PLOCK_WAITRES)) == 0) {
 			n = (o + 1) | PLOCK_ZOMB;
 			if (atomic_cmpset_int(&p->p_lock, o, n))
 				return(0);
+		} else if (o & PLOCK_WAITRES) {
+			return(1);
 		} else {
 			KKASSERT((o & PLOCK_MASK) > 0);
 			n = o | PLOCK_WAITING;
@@ -390,7 +427,8 @@ pholdzomb(struct proc *p)
 }
 
 /*
- * Release PLOCK_ZOMB and the hold count, waking up any waiters.
+ * Release PLOCK_ZOMB, PLOCK_WAITRES, and the hold count, waking up any
+ * waiters.
  *
  * WARNING!  On last release (p) can become instantly invalid due to
  *	     MP races.
@@ -415,7 +453,7 @@ prelezomb(struct proc *p)
 		o = p->p_lock;
 		KKASSERT((o & PLOCK_MASK) > 0);
 		cpu_ccfence();
-		n = (o - 1) & ~(PLOCK_ZOMB | PLOCK_WAITING);
+		n = (o - 1) & ~(PLOCK_ZOMB | PLOCK_WAITING | PLOCK_WAITRES);
 		if (atomic_cmpset_int(&p->p_lock, o, n)) {
 			if (o & PLOCK_WAITING)
 				wakeup(&p->p_lock);
@@ -1007,7 +1045,7 @@ proc_add_allproc(struct proc *p)
 	int random_offset;
 
 	if ((random_offset = randompid) != 0) {
-		read_random(&random_offset, sizeof(random_offset));
+		read_random(&random_offset, sizeof(random_offset), 1);
 		random_offset = (random_offset & 0x7FFFFFFF) % randompid;
 	}
 	proc_makepid(p, random_offset);
@@ -1702,8 +1740,8 @@ sysctl_kern_proc(SYSCTL_HANDLER_ARGS)
 				if ((p->p_flags & P_CONTROLT) == 0 ||
 				    p->p_session == NULL ||
 				    p->p_session->s_ttyp == NULL ||
-				    dev2udev(p->p_session->s_ttyp->t_dev) != 
-					(udev_t)name[0])
+				    devid_from_dev(p->p_session->s_ttyp->t_dev) !=
+					(dev_t)name[0])
 					continue;
 				break;
 

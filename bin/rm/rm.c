@@ -44,6 +44,7 @@
 #include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sysexits.h>
@@ -60,7 +61,9 @@ static void	checkdot(char **);
 static void	rm_file(char **);
 static int	rm_overwrite(const char *, struct stat *);
 static void	rm_tree(char **);
+#ifdef SIGINFO
 static void 	siginfo(int);
+#endif
 static void	usage(void);
 
 /*
@@ -133,7 +136,9 @@ main(int argc, char *argv[])
 			vflag = 1;
 			break;
 		case 'W':
+#ifdef S_IFWHT
 			Wflag = 1;
+#endif
 			break;
 		case 'x':
 			xflag = 1;
@@ -153,8 +158,10 @@ main(int argc, char *argv[])
 
 	checkdot(argv);
 	uid = geteuid();
-	
+
+#ifdef SIGINFO
 	signal(SIGINFO, siginfo);
+#endif
 
 	if (*argv) {
 		stdin_ok = isatty(STDIN_FILENO);
@@ -196,8 +203,10 @@ rm_tree(char **argv)
 	flags = FTS_PHYSICAL;
 	if (!needstat)
 		flags |= FTS_NOSTAT;
+#ifdef S_IFWHT
 	if (Wflag)
 		flags |= FTS_WHITEOUT;
+#endif
 	if (xflag)
 		flags |= FTS_XDEV;
 	if ((fts = fts_open(argv, flags, NULL)) == NULL) {
@@ -236,12 +245,14 @@ rm_tree(char **argv)
 				fts_set(fts, p, FTS_SKIP);
 				p->fts_number = SKIPPED;
 			}
+#ifdef _ST_FLAGS_PRESENT_
 			else if (!uid &&
 				 (p->fts_statp->st_flags & (UF_APPEND|UF_IMMUTABLE)) &&
 				 !(p->fts_statp->st_flags & (SF_APPEND|SF_IMMUTABLE)) &&
 				 lchflags(p->fts_accpath,
 					 p->fts_statp->st_flags &= ~(UF_APPEND|UF_IMMUTABLE)) < 0)
 				goto err;
+#endif
 			continue;
 		case FTS_DP:
 			/* Post-order: see if user skipped. */
@@ -260,11 +271,13 @@ rm_tree(char **argv)
 		}
 
 		rval = 0;
+#ifdef _ST_FLAGS_PRESENT_
 		if (!uid &&
 		    (p->fts_statp->st_flags & (UF_APPEND|UF_IMMUTABLE)) &&
 		    !(p->fts_statp->st_flags & (SF_APPEND|SF_IMMUTABLE)))
 			rval = lchflags(p->fts_accpath,
 				       p->fts_statp->st_flags &= ~(UF_APPEND|UF_IMMUTABLE));
+#endif
 
 		if (rval == 0) {
 			/*
@@ -283,7 +296,7 @@ rm_tree(char **argv)
 					continue;
 				}
 				break;
-
+#ifdef S_IFWHT
 			case FTS_W:
 				rval = undelete(p->fts_accpath);
 				if (rval == 0 && (fflag && errno == ENOENT)) {
@@ -293,7 +306,7 @@ rm_tree(char **argv)
 					continue;
 				}
 				break;
-
+#endif
 			case FTS_NS:
 			/*
 			 * Assume that since fts_read() couldn't stat
@@ -315,7 +328,9 @@ rm_tree(char **argv)
 				}
 			}
 		}
+#ifdef _ST_FLAGS_PRESENT_
 err:
+#endif
 		warn("%s", p->fts_path);
 		eval = 1;
 	}
@@ -344,7 +359,9 @@ rm_file(char **argv)
 		/* Assume if can't stat the file, can't unlink it. */
 		if (lstat(f, &sb)) {
 			if (Wflag) {
+#ifdef S_IFWHT
 				sb.st_mode = S_IFWHT|S_IWUSR|S_IRUSR;
+#endif
 			} else {
 				if (!fflag || errno != ENOENT) {
 					warn("%s", f);
@@ -366,14 +383,19 @@ rm_file(char **argv)
 		if (!fflag && !S_ISWHT(sb.st_mode) && !check(f, f, &sb))
 			continue;
 		rval = 0;
+#ifdef _ST_FLAGS_PRESENT_
 		if (!uid && !S_ISWHT(sb.st_mode) &&
 		    (sb.st_flags & (UF_APPEND|UF_IMMUTABLE)) &&
 		    !(sb.st_flags & (SF_APPEND|SF_IMMUTABLE)))
 			rval = lchflags(f, sb.st_flags & ~(UF_APPEND|UF_IMMUTABLE));
+#endif
 		if (rval == 0) {
+#ifdef S_IFWHT
 			if (S_ISWHT(sb.st_mode))
 				rval = undelete(f);
-			else if (S_ISDIR(sb.st_mode))
+			else
+#endif
+			if (S_ISDIR(sb.st_mode))
 				rval = rmdir(f);
 			else {
 				if (Pflag)
@@ -480,7 +502,7 @@ check(const char *path, const char *name, struct stat *sp)
 		{ 'v', "never" , 0, 1 },
 		{ 0, NULL, 0, 0 }
 	};
-	char modep[15], *flagsp;
+	char modep[15], *flagsp = NULL;
 
 	if (perm_answer != -1)
 		return (perm_answer);
@@ -499,13 +521,18 @@ check(const char *path, const char *name, struct stat *sp)
 	         * barf later.
 		 */
 		if (!stdin_ok || S_ISLNK(sp->st_mode) || Pflag ||
-		    (!access(name, W_OK) &&
-		    !(sp->st_flags & (SF_APPEND|SF_IMMUTABLE)) &&
-		    (!(sp->st_flags & (UF_APPEND|UF_IMMUTABLE)) || !uid)))
+		    (!access(name, W_OK)
+#ifdef _ST_FLAGS_PRESENT_
+		    && !(sp->st_flags & (SF_APPEND|SF_IMMUTABLE)) &&
+		    (!(sp->st_flags & (UF_APPEND|UF_IMMUTABLE)) || !uid)
+#endif
+		    ))
 			return (1);
 		strmode(sp->st_mode, modep);
+#ifdef _ST_FLAGS_PRESENT_
 		if ((flagsp = fflagstostr(sp->st_flags)) == NULL)
 			err(1, NULL);
+#endif
 		fprintf(stderr, "override %s%s%s/%s %s%sfor %s? ",
 		    modep + 1, modep[9] == ' ' ? "" : " ",
 		    user_from_uid(sp->st_uid, 0),
@@ -630,8 +657,10 @@ usage(void)
 	exit(EX_USAGE);
 }
 
+#ifdef SIGINFO
 static void
 siginfo(int notused __unused)
 {
 	info = 1;
 }
+#endif

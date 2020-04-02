@@ -44,6 +44,7 @@
 #include <sys/lockf.h>
 #include <sys/jail.h>
 #include <sys/unistd.h>
+#include <machine/tls.h>
 #include <machine/smp.h>
 
 SYSCTL_NODE(, 0,	  sysctl, CTLFLAG_RW, 0,
@@ -93,6 +94,10 @@ SYSCTL_STRING(_kern, KERN_OSTYPE, ostype, CTLFLAG_RD | CTLFLAG_NOLOCK,
 
 SYSCTL_INT(_kern, KERN_OSRELDATE, osreldate, CTLFLAG_RD,
     &osreldate, 0, "Operating system release date");
+
+static int tls_extra = RTLD_STATIC_TLS_EXTRA_DEFAULT;
+SYSCTL_INT(_kern, KERN_STATIC_TLS_EXTRA, tls_extra, CTLFLAG_RW | CTLFLAG_NOLOCK,
+    &tls_extra, 0, "Extra static tls space for libraries");
 
 SYSCTL_INT(_kern, KERN_MAXPROC, maxproc, CTLFLAG_RD, 
     &maxproc, 0, "Maximum number of processes");
@@ -172,13 +177,14 @@ sysctl_hostname(SYSCTL_HANDLER_ARGS)
 	if (p)
 		pr = p->p_ucred->cr_prison;
 	if (p && pr) {
-		if (!pr->pr_set_hostname_allowed && req->newptr)
+		if (!PRISON_CAP_ISSET(pr->pr_caps,
+			PRISON_CAP_SYS_SET_HOSTNAME) && req->newptr)
 			return(EPERM);
-		error = sysctl_handle_string(oidp, 
+		error = sysctl_handle_string(oidp,
 		    p->p_ucred->cr_prison->pr_host,
 		    sizeof p->p_ucred->cr_prison->pr_host, req);
 	} else {
-		error = sysctl_handle_string(oidp, 
+		error = sysctl_handle_string(oidp,
 		    hostname, sizeof hostname, req);
 	}
 	if (req->newptr) {
@@ -188,7 +194,7 @@ sysctl_hostname(SYSCTL_HANDLER_ARGS)
 	return (error);
 }
 
-SYSCTL_PROC(_kern, KERN_HOSTNAME, hostname, 
+SYSCTL_PROC(_kern, KERN_HOSTNAME, hostname,
        CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_PRISON | CTLFLAG_NOLOCK,
        0, 0, sysctl_hostname, "A", "Hostname");
 

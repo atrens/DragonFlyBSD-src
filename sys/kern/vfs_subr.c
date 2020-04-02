@@ -81,7 +81,6 @@
 #include <vm/vm_zone.h>
 
 #include <sys/buf2.h>
-#include <sys/mplock2.h>
 #include <vm/vm_page2.h>
 
 #include <netinet/in.h>
@@ -127,6 +126,7 @@ static int	vfs_free_netcred (struct radix_node *rn, void *w);
 static void	vfs_free_addrlist_af (struct radix_node_head **prnh);
 static int	vfs_hang_addrlist (struct mount *mp, struct netexport *nep,
 	            const struct export_args *argp);
+static void vclean_vxlocked(struct vnode *vp, int flags);
 
 __read_mostly int prtactive = 0; /* 1 => print out reclaim of active vnodes */
 
@@ -201,10 +201,14 @@ vfs_subr_init(void)
  *   1 = seconds and nanoseconds, accurate within 1/HZ.
  *   2 = seconds and nanoseconds, truncated to microseconds.
  * >=3 = seconds and nanoseconds, maximum precision.
+ *
+ * Note that utimes() precision is microseconds because it takes a timeval
+ * structure, so its probably best to default to USEC and not NSEC.
  */
-enum { TSP_SEC, TSP_HZ, TSP_USEC, TSP_NSEC };
+enum { TSP_SEC, TSP_HZ, TSP_USEC, TSP_NSEC,
+       TSP_USEC_PRECISE, TSP_NSEC_PRECISE };
 
-__read_mostly static int timestamp_precision = TSP_SEC;
+__read_mostly static int timestamp_precision = TSP_USEC;
 SYSCTL_INT(_vfs, OID_AUTO, timestamp_precision, CTLFLAG_RW,
 		&timestamp_precision, 0, "Precision of file timestamps");
 
@@ -216,22 +220,28 @@ SYSCTL_INT(_vfs, OID_AUTO, timestamp_precision, CTLFLAG_RW,
 void
 vfs_timestamp(struct timespec *tsp)
 {
-	struct timeval tv;
-
 	switch (timestamp_precision) {
-	case TSP_SEC:
-		tsp->tv_sec = time_second;
+	case TSP_SEC:		/* seconds precision */
+		getnanotime(tsp);
 		tsp->tv_nsec = 0;
 		break;
-	case TSP_HZ:
+	default:
+	case TSP_HZ:		/* ticks precision (limit to microseconds) */
+		getnanotime(tsp);
+		tsp->tv_nsec -= tsp->tv_nsec % 1000;
+		break;
+	case TSP_USEC:		/* microseconds (ticks precision) */
+		getnanotime(tsp);
+		tsp->tv_nsec -= tsp->tv_nsec % 1000;
+		break;
+	case TSP_NSEC:		/* nanoseconds (ticks precision) */
 		getnanotime(tsp);
 		break;
-	case TSP_USEC:
-		microtime(&tv);
-		TIMEVAL_TO_TIMESPEC(&tv, tsp);
+	case TSP_USEC_PRECISE:	/* microseconds (high preceision) */
+		nanotime(tsp);
+		tsp->tv_nsec -= tsp->tv_nsec % 1000;
 		break;
-	case TSP_NSEC:
-	default:
+	case TSP_NSEC_PRECISE:	/* nanoseconds (high precision) */
 		nanotime(tsp);
 		break;
 	}
@@ -1213,6 +1223,8 @@ addaliasu(struct vnode *nvp, int x, int y)
  *
  * May only be called if the vnode is in a known state (i.e. being prevented
  * from being deallocated by some other condition such as a vfs inode hold).
+ *
+ * This call might not succeed.
  */
 void
 vclean_unlocked(struct vnode *vp)
@@ -1231,7 +1243,7 @@ vclean_unlocked(struct vnode *vp)
  * there are active references, the vnode is being ripped out and we have
  * to call VOP_CLOSE() as appropriate before we can reclaim it.
  */
-void
+static void
 vclean_vxlocked(struct vnode *vp, int flags)
 {
 	int active;
@@ -1554,34 +1566,10 @@ vgone_vxlocked(struct vnode *vp)
 }
 
 /*
- * Lookup a vnode by device number.
- *
- * Returns non-zero and *vpp set to a vref'd vnode on success.
- * Returns zero on failure.
- */
-int
-vfinddev(cdev_t dev, enum vtype type, struct vnode **vpp)
-{
-	struct vnode *vp;
-
-	lwkt_gettoken(&spechash_token);
-	SLIST_FOREACH(vp, &dev->si_hlist, v_cdevnext) {
-		if (type == vp->v_type) {
-			*vpp = vp;
-			vref(vp);
-			lwkt_reltoken(&spechash_token);
-			return (1);
-		}
-	}
-	lwkt_reltoken(&spechash_token);
-	return (0);
-}
-
-/*
  * Calculate the total number of references to a special device.  This
  * routine may only be called for VBLK and VCHR vnodes since v_rdev is
- * an overloaded field.  Since udev2dev can now return NULL, we have
- * to check for a NULL v_rdev.
+ * an overloaded field.  Since dev_from_devid() can now return NULL, we
+ * have to check for a NULL v_rdev.
  */
 int
 count_dev(cdev_t dev)
@@ -1862,10 +1850,7 @@ vfs_mountedon(struct vnode *vp)
 {
 	cdev_t dev;
 
-	if ((dev = vp->v_rdev) == NULL) {
-/*		if (vp->v_type != VBLK)
-			dev = get_dev(vp->v_uminor, vp->v_umajor); */
-	}
+	dev = vp->v_rdev;
 	if (dev != NULL && dev->si_mountpoint)
 		return (EBUSY);
 	return (0);
@@ -2406,6 +2391,9 @@ vfs_msync(struct mount *mp, int flags)
  * scan1 is a fast pre-check.  There could be hundreds of thousands of
  * vnodes, we cannot afford to do anything heavy weight until we have a
  * fairly good indication that there is work to do.
+ *
+ * The new namecache holds the vnode for each v_namecache association
+ * so allow these refs.
  */
 static
 int
@@ -2414,8 +2402,8 @@ vfs_msync_scan1(struct mount *mp, struct vnode *vp, void *data)
 	int flags = (int)(intptr_t)data;
 
 	if ((vp->v_flag & VRECLAIMED) == 0) {
-		if (vp->v_auxrefs == 0 && VREFCNT(vp) <= 0 &&
-		    vp->v_object) {
+		if (vp->v_auxrefs == vp->v_namecache_count &&
+		    VREFCNT(vp) <= 0 && vp->v_object) {
 			return(0);	/* call scan2 */
 		}
 		if ((mp->mnt_flag & MNT_RDONLY) == 0 &&

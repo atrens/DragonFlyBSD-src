@@ -46,7 +46,6 @@
 #include <sys/fcntl.h>
 #include <sys/buf.h>
 #include <sys/proc.h>
-#include <sys/namei.h>
 #include <sys/mount.h>
 #include <sys/vnode.h>
 #include <sys/mountctl.h>
@@ -269,6 +268,9 @@ hammer2_vop_fsync(struct vop_fsync_args *ap)
 	return (error1);
 }
 
+/*
+ * No lock needed, just handle ip->update
+ */
 static
 int
 hammer2_vop_access(struct vop_access_args *ap)
@@ -276,13 +278,25 @@ hammer2_vop_access(struct vop_access_args *ap)
 	hammer2_inode_t *ip = VTOI(ap->a_vp);
 	uid_t uid;
 	gid_t gid;
+	mode_t mode;
+	uint32_t uflags;
 	int error;
+	int update;
 
-	hammer2_inode_lock(ip, HAMMER2_RESOLVE_SHARED);
+retry:
+	update = spin_access_start(&ip->cluster_spin);
+
+	/*hammer2_inode_lock(ip, HAMMER2_RESOLVE_SHARED);*/
 	uid = hammer2_to_unix_xid(&ip->meta.uid);
 	gid = hammer2_to_unix_xid(&ip->meta.gid);
-	error = vop_helper_access(ap, uid, gid, ip->meta.mode, ip->meta.uflags);
-	hammer2_inode_unlock(ip);
+	mode = ip->meta.mode;
+	uflags = ip->meta.uflags;
+	/*hammer2_inode_unlock(ip);*/
+
+	if (__predict_false(spin_access_end(&ip->cluster_spin, update)))
+		goto retry;
+
+	error = vop_helper_access(ap, uid, gid, mode, uflags);
 
 	return (error);
 }
@@ -296,6 +310,7 @@ hammer2_vop_getattr(struct vop_getattr_args *ap)
 	struct vnode *vp;
 	struct vattr *vap;
 	hammer2_chain_t *chain;
+	int update;
 	int i;
 
 	vp = ap->a_vp;
@@ -304,7 +319,8 @@ hammer2_vop_getattr(struct vop_getattr_args *ap)
 	ip = VTOI(vp);
 	pmp = ip->pmp;
 
-	hammer2_inode_lock(ip, HAMMER2_RESOLVE_SHARED);
+retry:
+	update = spin_access_start(&ip->cluster_spin);
 
 	vap->va_fsid = pmp->mp->mnt_stat.f_fsid.val[0];
 	vap->va_fileid = ip->meta.inum;
@@ -346,7 +362,51 @@ hammer2_vop_getattr(struct vop_getattr_args *ap)
 	vap->va_vaflags = VA_UID_UUID_VALID | VA_GID_UUID_VALID |
 			  VA_FSID_UUID_VALID;
 
-	hammer2_inode_unlock(ip);
+	if (__predict_false(spin_access_end(&ip->cluster_spin, update)))
+		goto retry;
+
+	return (0);
+}
+
+static
+int
+hammer2_vop_getattr_quick(struct vop_getattr_args *ap)
+{
+	hammer2_pfs_t *pmp;
+	hammer2_inode_t *ip;
+	struct vnode *vp;
+	struct vattr *vap;
+	int update;
+
+	vp = ap->a_vp;
+	vap = ap->a_vap;
+
+	ip = VTOI(vp);
+	pmp = ip->pmp;
+
+retry:
+	update = spin_access_start(&ip->cluster_spin);
+
+	vap->va_fsid = pmp->mp->mnt_stat.f_fsid.val[0];
+	vap->va_fileid = ip->meta.inum;
+	vap->va_mode = ip->meta.mode;
+	vap->va_nlink = ip->meta.nlinks;
+	vap->va_uid = hammer2_to_unix_xid(&ip->meta.uid);
+	vap->va_gid = hammer2_to_unix_xid(&ip->meta.gid);
+	vap->va_rmajor = 0;
+	vap->va_rminor = 0;
+	vap->va_size = -1;
+	vap->va_blocksize = HAMMER2_PBUFSIZE;
+	vap->va_flags = ip->meta.uflags;
+	vap->va_type = hammer2_get_vtype(ip->meta.type);
+	vap->va_filerev = 0;
+	vap->va_uid_uuid = ip->meta.uid;
+	vap->va_gid_uuid = ip->meta.gid;
+	vap->va_vaflags = VA_UID_UUID_VALID | VA_GID_UUID_VALID |
+			  VA_FSID_UUID_VALID;
+
+	if (__predict_false(spin_access_end(&ip->cluster_spin, update)))
+		goto retry;
 
 	return (0);
 }
@@ -381,7 +441,6 @@ hammer2_vop_setattr(struct vop_setattr_args *ap)
 		return (ENOSPC);
 	}
 
-	/*hammer2_pfs_memory_wait(ip->pmp);*/
 	hammer2_trans_init(ip->pmp, 0);
 	hammer2_inode_lock(ip, 0);
 	error = 0;
@@ -396,8 +455,10 @@ hammer2_vop_setattr(struct vop_setattr_args *ap)
 		if (error == 0) {
 			if (ip->meta.uflags != flags) {
 				hammer2_inode_modify(ip);
+				spin_lock_update(&ip->cluster_spin);
 				ip->meta.uflags = flags;
 				ip->meta.ctime = ctime;
+				spin_unlock_update(&ip->cluster_spin);
 				kflags |= NOTE_ATTRIB;
 			}
 			if (ip->meta.uflags & (IMMUTABLE | APPEND)) {
@@ -429,10 +490,12 @@ hammer2_vop_setattr(struct vop_setattr_args *ap)
 			    ip->meta.mode != cur_mode
 			) {
 				hammer2_inode_modify(ip);
+				spin_lock_update(&ip->cluster_spin);
 				ip->meta.uid = uuid_uid;
 				ip->meta.gid = uuid_gid;
 				ip->meta.mode = cur_mode;
 				ip->meta.ctime = ctime;
+				spin_unlock_update(&ip->cluster_spin);
 			}
 			kflags |= NOTE_ATTRIB;
 		}
@@ -481,8 +544,10 @@ hammer2_vop_setattr(struct vop_setattr_args *ap)
 					 cur_uid, cur_gid, &cur_mode);
 		if (error == 0 && ip->meta.mode != cur_mode) {
 			hammer2_inode_modify(ip);
+			spin_lock_update(&ip->cluster_spin);
 			ip->meta.mode = cur_mode;
 			ip->meta.ctime = ctime;
+			spin_unlock_update(&ip->cluster_spin);
 			kflags |= NOTE_ATTRIB;
 		}
 	}
@@ -824,7 +889,6 @@ hammer2_vop_write(struct vop_write_args *ap)
 	if (uio->uio_segflg == UIO_NOCOPY) {
 		hammer2_trans_init(ip->pmp, HAMMER2_TRANS_BUFCACHE);
 	} else {
-		/*hammer2_pfs_memory_wait(ip->pmp);*/
 		hammer2_trans_init(ip->pmp, 0);
 	}
 	error = hammer2_write_file(ip, uio, ioflag, seqcount);
@@ -1406,7 +1470,6 @@ hammer2_vop_nmkdir(struct vop_nmkdir_args *ap)
 	name = ncp->nc_name;
 	name_len = ncp->nc_nlen;
 
-	/*hammer2_pfs_memory_wait(dip->pmp);*/
 	hammer2_trans_init(dip->pmp, 0);
 
 	inum = hammer2_trans_newinum(dip->pmp);
@@ -1542,7 +1605,6 @@ hammer2_vop_nlink(struct vop_nlink_args *ap)
 	 */
 	ip = VTOI(ap->a_vp);
 	KASSERT(ip->pmp, ("ip->pmp is NULL %p %p", ip, ip->pmp));
-	/*hammer2_pfs_memory_wait(ip->pmp);*/
 	hammer2_trans_init(ip->pmp, 0);
 
 	/*
@@ -1618,7 +1680,6 @@ hammer2_vop_ncreate(struct vop_ncreate_args *ap)
 	ncp = ap->a_nch->ncp;
 	name = ncp->nc_name;
 	name_len = ncp->nc_nlen;
-	/*hammer2_pfs_memory_wait(dip->pmp);*/
 	hammer2_trans_init(dip->pmp, 0);
 
 	inum = hammer2_trans_newinum(dip->pmp);
@@ -1701,7 +1762,6 @@ hammer2_vop_nmknod(struct vop_nmknod_args *ap)
 	ncp = ap->a_nch->ncp;
 	name = ncp->nc_name;
 	name_len = ncp->nc_nlen;
-	/*hammer2_pfs_memory_wait(dip->pmp);*/
 	hammer2_trans_init(dip->pmp, 0);
 
 	/*
@@ -1779,7 +1839,6 @@ hammer2_vop_nsymlink(struct vop_nsymlink_args *ap)
 	ncp = ap->a_nch->ncp;
 	name = ncp->nc_name;
 	name_len = ncp->nc_nlen;
-	/*hammer2_pfs_memory_wait(dip->pmp);*/
 	hammer2_trans_init(dip->pmp, 0);
 
 	ap->a_vap->va_type = VLNK;	/* enforce type */
@@ -1902,7 +1961,6 @@ hammer2_vop_nremove(struct vop_nremove_args *ap)
 		}
 	}
 
-	/*hammer2_pfs_memory_wait(dip->pmp);*/
 	hammer2_trans_init(dip->pmp, 0);
 	hammer2_inode_lock(dip, 0);
 
@@ -2002,7 +2060,6 @@ hammer2_vop_nrmdir(struct vop_nrmdir_args *ap)
 		return (ENOSPC);
 #endif
 
-	/*hammer2_pfs_memory_wait(dip->pmp);*/
 	hammer2_trans_init(dip->pmp, 0);
 	hammer2_inode_lock(dip, 0);
 
@@ -2100,7 +2157,6 @@ hammer2_vop_nrename(struct vop_nrename_args *ap)
 	tname = tncp->nc_name;
 	tname_len = tncp->nc_nlen;
 
-	/*hammer2_pfs_memory_wait(tdip->pmp);*/
 	hammer2_trans_init(tdip->pmp, 0);
 
 	update_tdip = 0;
@@ -2482,6 +2538,7 @@ struct vop_ops hammer2_vnode_vops = {
 	.vop_nrmdir	= hammer2_vop_nrmdir,
 	.vop_nrename	= hammer2_vop_nrename,
 	.vop_getattr	= hammer2_vop_getattr,
+	.vop_getattr_quick = hammer2_vop_getattr_quick,
 	.vop_setattr	= hammer2_vop_setattr,
 	.vop_readdir	= hammer2_vop_readdir,
 	.vop_readlink	= hammer2_vop_readlink,

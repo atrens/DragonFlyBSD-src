@@ -27,6 +27,7 @@
 #ifndef _LINUX_REBOOT_H_
 #define _LINUX_REBOOT_H_
 
+#include <linux/smp.h>
 #include <linux/linkage.h>
 #include <linux/cache.h>
 #include <linux/spinlock.h>

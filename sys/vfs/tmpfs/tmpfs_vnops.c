@@ -68,12 +68,28 @@
 #include "tmpfs.h"
 
 static void tmpfs_strategy_done(struct bio *bio);
-static void tmpfs_move_pages(vm_object_t src, vm_object_t dst);
+static void tmpfs_move_pages(vm_object_t src, vm_object_t dst, int movflags);
 
-static int tmpfs_cluster_enable = 1;
+/*
+ * bufcache_mode:
+ *	0	Normal page queue operation on flush.  Try to keep in memory.
+ *	1	Try to cache on flush to swap (default).
+ *	2	Always page to swap (not recommended).
+ */
+__read_mostly static int tmpfs_cluster_rd_enable = 1;
+__read_mostly static int tmpfs_cluster_wr_enable = 1;
+__read_mostly int tmpfs_bufcache_mode = 1;
 SYSCTL_NODE(_vfs, OID_AUTO, tmpfs, CTLFLAG_RW, 0, "TMPFS filesystem");
-SYSCTL_INT(_vfs_tmpfs, OID_AUTO, cluster_enable, CTLFLAG_RW,
-		&tmpfs_cluster_enable, 0, "");
+SYSCTL_INT(_vfs_tmpfs, OID_AUTO, cluster_rd_enable, CTLFLAG_RW,
+		&tmpfs_cluster_rd_enable, 0, "");
+SYSCTL_INT(_vfs_tmpfs, OID_AUTO, cluster_wr_enable, CTLFLAG_RW,
+		&tmpfs_cluster_wr_enable, 0, "");
+SYSCTL_INT(_vfs_tmpfs, OID_AUTO, bufcache_mode, CTLFLAG_RW,
+		&tmpfs_bufcache_mode, 0, "");
+
+#define TMPFS_MOVF_FROMBACKING	0x0001
+#define TMPFS_MOVF_DEACTIVATE	0x0002
+
 
 static __inline
 void
@@ -248,7 +264,8 @@ tmpfs_open(struct vop_open_args *ap)
 			TMPFS_NODE_LOCK(node);
 			if (node->tn_reg.tn_pages_in_aobj) {
 				tmpfs_move_pages(node->tn_reg.tn_aobj,
-						 vp->v_object);
+						 vp->v_object,
+						 TMPFS_MOVF_FROMBACKING);
 				node->tn_reg.tn_pages_in_aobj = 0;
 			}
 			TMPFS_NODE_UNLOCK(node);
@@ -345,7 +362,6 @@ tmpfs_getattr(struct vop_getattr_args *ap)
 
 	tmpfs_update(vp);
 
-	TMPFS_NODE_LOCK_SH(node);
 	vap->va_type = vp->v_type;
 	vap->va_mode = node->tn_mode;
 	vap->va_nlink = node->tn_links;
@@ -369,10 +385,44 @@ tmpfs_getattr(struct vop_getattr_args *ap)
 	}
 	vap->va_bytes = round_page(node->tn_size);
 	vap->va_filerev = 0;
-	TMPFS_NODE_UNLOCK(node);
 
 	return 0;
 }
+
+/* --------------------------------------------------------------------- */
+
+int
+tmpfs_getattr_quick(struct vop_getattr_args *ap)
+{
+	struct vnode *vp = ap->a_vp;
+	struct vattr *vap = ap->a_vap;
+	struct tmpfs_node *node;
+
+	node = VP_TO_TMPFS_NODE(vp);
+
+	tmpfs_update(vp);
+
+	vap->va_type = vp->v_type;
+	vap->va_mode = node->tn_mode;
+	vap->va_nlink = node->tn_links;
+	vap->va_uid = node->tn_uid;
+	vap->va_gid = node->tn_gid;
+	vap->va_fsid = vp->v_mount->mnt_stat.f_fsid.val[0];
+	vap->va_fileid = node->tn_id;
+	vap->va_size = node->tn_size;
+	vap->va_blocksize = PAGE_SIZE;
+	vap->va_gen = node->tn_gen;
+	vap->va_flags = node->tn_flags;
+	if (vp->v_type == VBLK || vp->v_type == VCHR) {
+		vap->va_rmajor = umajor(node->tn_rdev);
+		vap->va_rminor = uminor(node->tn_rdev);
+	}
+	vap->va_bytes = -1;
+	vap->va_filerev = 0;
+
+	return 0;
+}
+
 
 /* --------------------------------------------------------------------- */
 
@@ -395,7 +445,9 @@ tmpfs_setattr(struct vop_setattr_args *ap)
 	if (error == 0 && (vap->va_size != VNOVAL)) {
 		/* restore any saved pages before proceeding */
 		if (node->tn_reg.tn_pages_in_aobj) {
-			tmpfs_move_pages(node->tn_reg.tn_aobj, vp->v_object);
+			tmpfs_move_pages(node->tn_reg.tn_aobj, vp->v_object,
+					 TMPFS_MOVF_FROMBACKING |
+					 TMPFS_MOVF_DEACTIVATE);
 			node->tn_reg.tn_pages_in_aobj = 0;
 		}
 		if (vap->va_size > node->tn_size)
@@ -517,7 +569,8 @@ tmpfs_read(struct vop_read_args *ap)
 	if (node->tn_reg.tn_pages_in_aobj) {
 		TMPFS_NODE_LOCK(node);
 		if (node->tn_reg.tn_pages_in_aobj) {
-			tmpfs_move_pages(node->tn_reg.tn_aobj, vp->v_object);
+			tmpfs_move_pages(node->tn_reg.tn_aobj, vp->v_object,
+					 TMPFS_MOVF_FROMBACKING);
 			node->tn_reg.tn_pages_in_aobj = 0;
 		}
 		TMPFS_NODE_UNLOCK(node);
@@ -532,19 +585,20 @@ tmpfs_read(struct vop_read_args *ap)
 		 */
 		offset = (size_t)uio->uio_offset & TMPFS_BLKMASK64;
 		base_offset = (off_t)uio->uio_offset - offset;
-		bp = getcacheblk(vp, base_offset, TMPFS_BLKSIZE, GETBLK_KVABIO);
+		bp = getcacheblk(vp, base_offset,
+				 node->tn_blksize, GETBLK_KVABIO);
 		if (bp == NULL) {
-			if (tmpfs_cluster_enable) {
+			if (tmpfs_cluster_rd_enable) {
 				error = cluster_readx(vp, node->tn_size,
 						     base_offset,
-						     TMPFS_BLKSIZE,
+						     node->tn_blksize,
 						     B_NOTMETA | B_KVABIO,
 						     uio->uio_resid,
 						     seqcount * MAXBSIZE,
 						     &bp);
 			} else {
 				error = bread_kvabio(vp, base_offset,
-						     TMPFS_BLKSIZE, &bp);
+						     node->tn_blksize, &bp);
 			}
 			if (error) {
 				brelse(bp);
@@ -570,7 +624,7 @@ tmpfs_read(struct vop_read_args *ap)
 		/*
 		 * Figure out how many bytes we can actually copy this loop.
 		 */
-		len = TMPFS_BLKSIZE - offset;
+		len = node->tn_blksize - offset;
 		if (len > uio->uio_resid)
 			len = uio->uio_resid;
 		if (len > node->tn_size - uio->uio_offset)
@@ -629,7 +683,8 @@ tmpfs_write(struct vop_write_args *ap)
 	 * restore any saved pages before proceeding
 	 */
 	if (node->tn_reg.tn_pages_in_aobj) {
-		tmpfs_move_pages(node->tn_reg.tn_aobj, vp->v_object);
+		tmpfs_move_pages(node->tn_reg.tn_aobj, vp->v_object,
+				 TMPFS_MOVF_FROMBACKING);
 		node->tn_reg.tn_pages_in_aobj = 0;
 	}
 
@@ -672,17 +727,20 @@ tmpfs_write(struct vop_write_args *ap)
 		 */
 		if (uio->uio_segflg == UIO_NOCOPY &&
 		    (ap->a_ioflag & IO_RECURSE) == 0) {
-			bwillwrite(TMPFS_BLKSIZE);
+			bwillwrite(node->tn_blksize);
 		}
 
 		/*
 		 * Use buffer cache I/O (via tmpfs_strategy)
+		 *
+		 * Calculate the maximum bytes we can write to the buffer at
+		 * this offset (after resizing).
 		 */
 		offset = (size_t)uio->uio_offset & TMPFS_BLKMASK64;
 		base_offset = (off_t)uio->uio_offset - offset;
-		len = TMPFS_BLKSIZE - offset;
-		if (len > uio->uio_resid)
-			len = uio->uio_resid;
+		len = uio->uio_resid;
+		if (len > TMPFS_BLKSIZE - offset)
+			len = TMPFS_BLKSIZE - offset;
 
 		if ((uio->uio_offset + len) > node->tn_size) {
 			trivial = (uio->uio_offset <= node->tn_size);
@@ -701,7 +759,7 @@ tmpfs_write(struct vop_write_args *ap)
 		 *
 		 * So just use bread() to do the right thing.
 		 */
-		error = bread_kvabio(vp, base_offset, TMPFS_BLKSIZE, &bp);
+		error = bread_kvabio(vp, base_offset, node->tn_blksize, &bp);
 		bkvasync(bp);
 		error = uiomovebp(bp, (char *)bp->b_data + offset, len, uio);
 		if (error) {
@@ -717,9 +775,12 @@ tmpfs_write(struct vop_write_args *ap)
 		kflags |= NOTE_WRITE;
 
 		/*
-		 * Always try to flush the page in the UIO_NOCOPY case.  This
-		 * can come from the pageout daemon or during vnode eviction.
-		 * It is not necessarily going to be marked IO_ASYNC/IO_SYNC.
+		 * UIO_NOCOPY is a sensitive state due to potentially being
+		 * issued from the pageout daemon while in a low-memory
+		 * situation.  However, in order to cluster the I/O nicely
+		 * (e.g. 64KB+ writes instead of 16KB writes), we still try
+		 * to follow the same semantics that any other filesystem
+		 * might use.
 		 *
 		 * For the normal case we buwrite(), dirtying the underlying
 		 * VM pages instead of dirtying the buffer and releasing the
@@ -759,25 +820,48 @@ tmpfs_write(struct vop_write_args *ap)
 			 *     unintended side-effects (e.g. setting
 			 *     PG_NOTMETA on the VM page).
 			 *
+			 * (c) For the pageout->putpages->generic_putpages->
+			 *     UIO_NOCOPY-write (here), issuing an immediate
+			 *     write prevents any real clustering from
+			 *     happening because the buffers probably aren't
+			 *     (yet) marked dirty, or lost due to prior use
+			 *     of buwrite().  Try to use the normal
+			 *     cluster_write() mechanism for performance.
+			 *
 			 * Hopefully this will unblock the VM system more
 			 * quickly under extreme tmpfs write load.
 			 */
 			if (vm_page_count_min(vm_page_free_hysteresis))
 				bp->b_flags |= B_DIRECT;
-			bp->b_flags |= B_AGE | B_RELBUF;
+			bp->b_flags |= B_AGE | B_RELBUF | B_TTC;
 			bp->b_act_count = 0;	/* buffer->deactivate pgs */
-			cluster_awrite(bp);
-		} else if (vm_page_count_target()) {
+			if (tmpfs_cluster_wr_enable &&
+			    (ap->a_ioflag & (IO_SYNC | IO_DIRECT)) == 0) {
+				cluster_write(bp, node->tn_size,
+					      node->tn_blksize, seqcount);
+			} else {
+				cluster_awrite(bp);
+			}
+		} else if (vm_pages_needed || vm_paging_needed(0) ||
+			   tmpfs_bufcache_mode >= 2) {
 			/*
-			 * Normal (userland) write but we are low on memory,
-			 * run the buffer the buffer cache.
+			 * If the pageout daemon is running we cycle the
+			 * write through the buffer cache normally to
+			 * pipeline the flush, thus avoiding adding any
+			 * more memory pressure to the pageout daemon.
 			 */
 			bp->b_act_count = 0;	/* buffer->deactivate pgs */
-			bdwrite(bp);
+			if (tmpfs_cluster_wr_enable) {
+				cluster_write(bp, node->tn_size,
+					      node->tn_blksize, seqcount);
+			} else {
+				bdwrite(bp);
+			}
 		} else {
 			/*
 			 * Otherwise run the buffer directly through to the
-			 * backing VM store.
+			 * backing VM store, leaving the buffer clean so
+			 * buffer limits do not force early flushes to swap.
 			 */
 			buwrite(bp);
 			/*vm_wait_nominal();*/
@@ -893,6 +977,14 @@ tmpfs_strategy(struct vop_strategy_args *ap)
 		bp->b_error = 0;
 		biodone(bio);
 	} else {
+		/*
+		 * Tell the buffer cache to try to recycle the pages
+		 * to PQ_CACHE on release.
+		 */
+		if (tmpfs_bufcache_mode >= 2 ||
+		    (tmpfs_bufcache_mode == 1 && vm_paging_needed(0))) {
+			bp->b_flags |= B_TTC;
+		}
 		nbio = push_bio(bio);
 		nbio->bio_done = tmpfs_strategy_done;
 		nbio->bio_offset = bio->bio_offset;
@@ -936,15 +1028,23 @@ tmpfs_strategy_done(struct bio *bio)
 	biodone(bio);
 }
 
+/*
+ * To make write clustering work well make the backing store look
+ * contiguous to the cluster_*() code.  The swap_strategy() function
+ * will take it from there.
+ *
+ * Use MAXBSIZE-sized chunks as a micro-optimization to make random
+ * flushes leave full-sized gaps.
+ */
 static int
 tmpfs_bmap(struct vop_bmap_args *ap)
 {
 	if (ap->a_doffsetp != NULL)
 		*ap->a_doffsetp = ap->a_loffset;
 	if (ap->a_runp != NULL)
-		*ap->a_runp = 0;
+		*ap->a_runp = MAXBSIZE - (ap->a_loffset & (MAXBSIZE - 1));
 	if (ap->a_runb != NULL)
-		*ap->a_runb = 0;
+		*ap->a_runb = ap->a_loffset & (MAXBSIZE - 1);
 
 	return 0;
 }
@@ -987,9 +1087,11 @@ tmpfs_nremove(struct vop_nremove_args *ap)
 	tmp = VFS_TO_TMPFS(vp->v_mount);
 
 	TMPFS_NODE_LOCK(dnode);
+	TMPFS_NODE_LOCK(node);
 	de = tmpfs_dir_lookup(dnode, node, ncp);
 	if (de == NULL) {
 		error = ENOENT;
+		TMPFS_NODE_UNLOCK(node);
 		TMPFS_NODE_UNLOCK(dnode);
 		goto out;
 	}
@@ -998,6 +1100,7 @@ tmpfs_nremove(struct vop_nremove_args *ap)
 	if ((node->tn_flags & (IMMUTABLE | APPEND | NOUNLINK)) ||
 	    (dnode->tn_flags & APPEND)) {
 		error = EPERM;
+		TMPFS_NODE_UNLOCK(node);
 		TMPFS_NODE_UNLOCK(dnode);
 		goto out;
 	}
@@ -1012,11 +1115,9 @@ tmpfs_nremove(struct vop_nremove_args *ap)
 	 * reclaimed. */
 	tmpfs_free_dirent(tmp, de);
 
-	if (node->tn_links > 0) {
-	        TMPFS_NODE_LOCK(node);
+	if (node->tn_links > 0)
 		node->tn_status |= TMPFS_NODE_CHANGED;
-	        TMPFS_NODE_UNLOCK(node);
-	}
+	TMPFS_NODE_UNLOCK(node);
 
 	cache_unlink(ap->a_nch);
 	tmpfs_knote(vp, NOTE_DELETE);
@@ -1120,9 +1221,9 @@ tmpfs_nrename(struct vop_nrename_args *ap)
 	struct tmpfs_dirent *de, *tde;
 	struct tmpfs_mount *tmp;
 	struct tmpfs_node *fdnode;
+	struct tmpfs_node *tdnode;
 	struct tmpfs_node *fnode;
 	struct tmpfs_node *tnode;
-	struct tmpfs_node *tdnode;
 	char *newname;
 	char *oldname;
 	int error;
@@ -1161,9 +1262,10 @@ tmpfs_nrename(struct vop_nrename_args *ap)
 
 	fdnode = VP_TO_TMPFS_DIR(fdvp);
 	fnode = VP_TO_TMPFS_NODE(fvp);
-	TMPFS_NODE_LOCK(fdnode);
+
+	tmpfs_lock4(fdnode, tdnode, fnode, tnode);
+
 	de = tmpfs_dir_lookup(fdnode, fnode, fncp);
-	TMPFS_NODE_UNLOCK(fdnode);	/* XXX depend on namecache lock */
 
 	/* Avoid manipulating '.' and '..' entries. */
 	if (de == NULL) {
@@ -1238,12 +1340,10 @@ tmpfs_nrename(struct vop_nrename_args *ap)
 		tmpfs_dir_detach(fdnode, de);
 	} else {
 		/* XXX depend on namecache lock */
-		TMPFS_NODE_LOCK(fdnode);
 		KKASSERT(de == tmpfs_dir_lookup(fdnode, fnode, fncp));
 		RB_REMOVE(tmpfs_dirtree, &fdnode->tn_dir.tn_dirtree, de);
 		RB_REMOVE(tmpfs_dirtree_cookie,
 			  &fdnode->tn_dir.tn_cookietree, de);
-		TMPFS_NODE_UNLOCK(fdnode);
 	}
 
 	/*
@@ -1251,11 +1351,6 @@ tmpfs_nrename(struct vop_nrename_args *ap)
 	 * deallocate it at the end.
 	 */
 	if (newname != NULL) {
-#if 0
-		TMPFS_NODE_LOCK(fnode);
-		fnode->tn_status |= TMPFS_NODE_CHANGED;
-		TMPFS_NODE_UNLOCK(fnode);
-#endif
 		oldname = de->td_name;
 		de->td_name = newname;
 		de->td_namelen = (uint16_t)tncp->nc_nlen;
@@ -1268,10 +1363,8 @@ tmpfs_nrename(struct vop_nrename_args *ap)
 	 */
 	if (tvp != NULL) {
 		/* Remove the old entry from the target directory. */
-		TMPFS_NODE_LOCK(tdnode);
 		tde = tmpfs_dir_lookup(tdnode, tnode, tncp);
 		tmpfs_dir_detach(tdnode, tde);
-		TMPFS_NODE_UNLOCK(tdnode);
 		tmpfs_knote(tdnode->tn_vnode, NOTE_DELETE);
 
 		/*
@@ -1294,13 +1387,12 @@ tmpfs_nrename(struct vop_nrename_args *ap)
 		}
 		tmpfs_dir_attach(tdnode, de);
 	} else {
-		TMPFS_NODE_LOCK(tdnode);
 		tdnode->tn_status |= TMPFS_NODE_MODIFIED;
 		RB_INSERT(tmpfs_dirtree, &tdnode->tn_dir.tn_dirtree, de);
 		RB_INSERT(tmpfs_dirtree_cookie,
 			  &tdnode->tn_dir.tn_cookietree, de);
-		TMPFS_NODE_UNLOCK(tdnode);
 	}
+	tmpfs_unlock4(fdnode, tdnode, fnode, tnode);
 
 	/*
 	 * Finish up
@@ -1314,10 +1406,12 @@ tmpfs_nrename(struct vop_nrename_args *ap)
 	tmpfs_knote(ap->a_tdvp, NOTE_WRITE);
 	if (fnode->tn_vnode)
 		tmpfs_knote(fnode->tn_vnode, NOTE_RENAME);
-	error = 0;
+	if (tvp)
+		vrele(tvp);
+	return 0;
 
 out_locked:
-	;
+	tmpfs_unlock4(fdnode, tdnode, fnode, tnode);
 out:
 	if (tvp)
 		vrele(tvp);
@@ -1387,18 +1481,23 @@ tmpfs_nrmdir(struct vop_nrmdir_args *ap)
 	node = VP_TO_TMPFS_DIR(vp);
 
 	/*
-	 * Directories with more than two entries ('.' and '..') cannot
-	 * be removed.
+	 *
+	 */
+	TMPFS_NODE_LOCK(dnode);
+	TMPFS_NODE_LOCK(node);
+
+	/*
+	 * Only empty directories can be removed.
 	 */
 	if (node->tn_size > 0) {
 		error = ENOTEMPTY;
-		goto out;
+		goto out_locked;
 	}
 
 	if ((dnode->tn_flags & APPEND)
 	    || (node->tn_flags & (NOUNLINK | IMMUTABLE | APPEND))) {
 		error = EPERM;
-		goto out;
+		goto out_locked;
 	}
 
 	/*
@@ -1408,10 +1507,8 @@ tmpfs_nrmdir(struct vop_nrmdir_args *ap)
 	KKASSERT(node->tn_dir.tn_parent == dnode);
 
 	/*
-	 * Get the directory entry associated with node (vp).  This
-	 * was filled by tmpfs_lookup while looking up the entry.
+	 * Get the directory entry associated with node (vp)
 	 */
-	TMPFS_NODE_LOCK(dnode);
 	de = tmpfs_dir_lookup(dnode, node, ncp);
 	KKASSERT(TMPFS_DIRENT_MATCHES(de, ncp->nc_name, ncp->nc_nlen));
 
@@ -1419,19 +1516,11 @@ tmpfs_nrmdir(struct vop_nrmdir_args *ap)
 	if ((dnode->tn_flags & APPEND) ||
 	    node->tn_flags & (NOUNLINK | IMMUTABLE | APPEND)) {
 		error = EPERM;
-		TMPFS_NODE_UNLOCK(dnode);
-		goto out;
+		goto out_locked;
 	}
 
 	/* Detach the directory entry from the directory (dnode). */
 	tmpfs_dir_detach(dnode, de);
-	TMPFS_NODE_UNLOCK(dnode);
-
-	/* No vnode should be allocated for this entry from this point */
-	TMPFS_NODE_LOCK(dnode);
-	TMPFS_ASSERT_ELOCKED(dnode);
-	TMPFS_NODE_LOCK(node);
-	TMPFS_ASSERT_ELOCKED(node);
 
 	/*
 	 * Must set parent linkage to NULL (tested by ncreate to disallow
@@ -1442,9 +1531,6 @@ tmpfs_nrmdir(struct vop_nrmdir_args *ap)
 	dnode->tn_status |= TMPFS_NODE_ACCESSED | TMPFS_NODE_CHANGED |
 			    TMPFS_NODE_MODIFIED;
 
-	TMPFS_NODE_UNLOCK(node);
-	TMPFS_NODE_UNLOCK(dnode);
-
 	/* Free the directory entry we just deleted.  Note that the node
 	 * referred by it will not be removed until the vnode is really
 	 * reclaimed. */
@@ -1453,14 +1539,20 @@ tmpfs_nrmdir(struct vop_nrmdir_args *ap)
 	/* Release the deleted vnode (will destroy the node, notify
 	 * interested parties and clean it from the cache). */
 
-	TMPFS_NODE_LOCK(dnode);
 	dnode->tn_status |= TMPFS_NODE_CHANGED;
-	TMPFS_NODE_UNLOCK(dnode);
-	tmpfs_update(dvp);
 
+	TMPFS_NODE_UNLOCK(node);
+	TMPFS_NODE_UNLOCK(dnode);
+
+	tmpfs_update(dvp);
 	cache_unlink(ap->a_nch);
 	tmpfs_knote(dvp, NOTE_WRITE | NOTE_LINK);
-	error = 0;
+	vrele(vp);
+	return 0;
+
+out_locked:
+	TMPFS_NODE_UNLOCK(node);
+	TMPFS_NODE_UNLOCK(dnode);
 
 out:
 	vrele(vp);
@@ -1650,9 +1742,7 @@ tmpfs_inactive(struct vop_inactive_args *ap)
 	 * path from flushing the data for the removed file to disk.
 	 */
 	TMPFS_NODE_LOCK(node);
-	if ((node->tn_vpstate & TMPFS_VNODE_ALLOCATING) == 0 &&
-	    node->tn_links == 0)
-	{
+	if (node->tn_links == 0) {
 		node->tn_vpstate = TMPFS_VNODE_DOOMED;
 		TMPFS_NODE_UNLOCK(node);
 		if (node->tn_type == VREG)
@@ -1676,7 +1766,8 @@ tmpfs_inactive(struct vop_inactive_args *ap)
 			vinvalbuf(vp, V_SAVE, 0, 0);
 			KKASSERT(RB_EMPTY(&vp->v_rbdirty_tree));
 			KKASSERT(RB_EMPTY(&vp->v_rbclean_tree));
-			tmpfs_move_pages(vp->v_object, node->tn_reg.tn_aobj);
+			tmpfs_move_pages(vp->v_object, node->tn_reg.tn_aobj,
+					 TMPFS_MOVF_DEACTIVATE);
 			node->tn_reg.tn_pages_in_aobj = 1;
 		}
 
@@ -1716,8 +1807,7 @@ tmpfs_reclaim(struct vop_reclaim_args *ap)
 	 *
 	 * Directories have an extra link ref.
 	 */
-	if ((node->tn_vpstate & TMPFS_VNODE_ALLOCATING) == 0 &&
-	    node->tn_links == 0) {
+	if (node->tn_links == 0) {
 		node->tn_vpstate = TMPFS_VNODE_DOOMED;
 		tmpfs_free_node(tmp, node);
 		/* eats the lock */
@@ -1972,17 +2062,54 @@ tmpfs_move_pages_callback(vm_page_t p, void *data)
 		info->error = -1;
 		return -1;
 	}
-	vm_page_rename(p, info->dest_object, pindex);
-	vm_page_clear_commit(p);
-	vm_page_wakeup(p);
-	/* page automaticaly made dirty */
+
+	if ((info->pagerflags & TMPFS_MOVF_FROMBACKING) &&
+	    (p->flags & PG_SWAPPED) &&
+	    (p->flags & PG_NEED_COMMIT) == 0 &&
+	    p->dirty == 0) {
+		/*
+		 * If the page in the backing aobj was paged out to swap
+		 * it will be clean and it is better to free it rather
+		 * than re-dirty it.  We will assume that the page was
+		 * paged out to swap for a reason!
+		 *
+		 * This helps avoid unnecessary swap thrashing on the page.
+		 */
+		vm_page_free(p);
+	} else if ((info->pagerflags & TMPFS_MOVF_FROMBACKING) == 0 &&
+		   (p->flags & PG_NEED_COMMIT) == 0 &&
+		   p->dirty == 0) {
+		/*
+		 * If the page associated with the vnode was cleaned via
+		 * a tmpfs_strategy() call, it exists as a swap block in
+		 * aobj and it is again better to free it rather than
+		 * re-dirty it.  We will assume that the page was
+		 * paged out to swap for a reason!
+		 *
+		 * This helps avoid unnecessary swap thrashing on the page.
+		 */
+		vm_page_free(p);
+	} else {
+		/*
+		 * Rename the page, which will also ensure that it is flagged
+		 * as dirty and check whether a swap block association exists
+		 * in the target object or not, setting appropriate flags if
+		 * it does.
+		 */
+		vm_page_rename(p, info->dest_object, pindex);
+		vm_page_clear_commit(p);
+		if (info->pagerflags & TMPFS_MOVF_DEACTIVATE)
+			vm_page_deactivate(p);
+		vm_page_wakeup(p);
+		/* page automaticaly made dirty */
+	}
 
 	return 0;
 }
 
 static
 void
-tmpfs_move_pages(vm_object_t src, vm_object_t dst)
+tmpfs_move_pages(vm_object_t src, vm_object_t dst, int movflags)
 {
 	struct rb_vm_page_scan_info info;
 
@@ -1990,11 +2117,15 @@ tmpfs_move_pages(vm_object_t src, vm_object_t dst)
 	vm_object_hold(dst);
 	info.object = src;
 	info.dest_object = dst;
+	info.pagerflags = movflags;
 	do {
+		if (src->paging_in_progress)
+			vm_object_pip_wait(src, "objtfs");
 		info.error = 1;
 		vm_page_rb_tree_RB_SCAN(&src->rb_memq, NULL,
 					tmpfs_move_pages_callback, &info);
-	} while (info.error < 0);
+	} while (info.error < 0 || !RB_EMPTY(&src->rb_memq) ||
+		 src->paging_in_progress);
 	vm_object_drop(dst);
 	vm_object_drop(src);
 }
@@ -2016,6 +2147,7 @@ struct vop_ops tmpfs_vnode_vops = {
 	.vop_close =			tmpfs_close,
 	.vop_access =			tmpfs_access,
 	.vop_getattr =			tmpfs_getattr,
+	.vop_getattr_quick =		tmpfs_getattr_quick,
 	.vop_setattr =			tmpfs_setattr,
 	.vop_read =			tmpfs_read,
 	.vop_write =			tmpfs_write,

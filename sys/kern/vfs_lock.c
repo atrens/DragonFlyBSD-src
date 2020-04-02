@@ -49,7 +49,7 @@
  *	 the vnode lock is allowed to be SHARED.
  *
  *	 Switching into a CACHED or DYING state requires an exclusive vnode
- *	 lock or vx_lock (which is almost the same thing).
+ *	 lock or vx_lock (which is almost the same thing but not quite).
  */
 
 #include <sys/param.h>
@@ -249,38 +249,6 @@ _vinactive(struct vnode *vp)
 	atomic_add_int(&mycpu->gd_inactivevnodes, 1);
 }
 
-static __inline
-void
-_vinactive_tail(struct vnode *vp)
-{
-	struct vnode_index *vi = &vnode_list_hash[VLIST_HASH(vp)];
-
-	spin_lock(&vi->spin);
-
-	/*
-	 * Remove from active list if it is sitting on it
-	 */
-	switch(vp->v_state) {
-	case VS_ACTIVE:
-		TAILQ_REMOVE(&vi->active_list, vp, v_list);
-		atomic_add_int(&mycpu->gd_activevnodes, -1);
-		break;
-	case VS_INACTIVE:
-		spin_unlock(&vi->spin);
-		panic("_vinactive_tail: already inactive");
-		/* NOT REACHED */
-		return;
-	case VS_CACHED:
-	case VS_DYING:
-		break;
-	}
-
-	TAILQ_INSERT_TAIL(&vi->inactive_list, vp, v_list);
-	vp->v_state = VS_INACTIVE;
-	spin_unlock(&vi->spin);
-	atomic_add_int(&mycpu->gd_inactivevnodes, 1);
-}
-
 /*
  * Add a ref to an active vnode.  This function should never be called
  * with an inactive vnode (use vget() instead), but might be called
@@ -292,6 +260,13 @@ vref(struct vnode *vp)
 	KASSERT((VREFCNT(vp) > 0 && vp->v_state != VS_INACTIVE),
 		("vref: bad refcnt %08x %d", vp->v_refcnt, vp->v_state));
 	atomic_add_int(&vp->v_refcnt, 1);
+}
+
+void
+vref_special(struct vnode *vp)
+{
+	if ((atomic_fetchadd_int(&vp->v_refcnt, 1) & VREF_MASK) == 0)
+		atomic_add_int(&mycpu->gd_cachedvnodes, -1);
 }
 
 void
@@ -360,9 +335,13 @@ countcachedandinactivevnodes(void)
 void
 vrele(struct vnode *vp)
 {
+	int count;
+
+#if 1
+	count = vp->v_refcnt;
+	cpu_ccfence();
+
 	for (;;) {
-		int count = vp->v_refcnt;
-		cpu_ccfence();
 		KKASSERT((count & VREF_MASK) > 0);
 		KKASSERT(vp->v_state == VS_ACTIVE ||
 			 vp->v_state == VS_INACTIVE);
@@ -371,8 +350,10 @@ vrele(struct vnode *vp)
 		 * 2+ case
 		 */
 		if ((count & VREF_MASK) > 1) {
-			if (atomic_cmpset_int(&vp->v_refcnt, count, count - 1))
+			if (atomic_fcmpset_int(&vp->v_refcnt,
+					       &count, count - 1)) {
 				break;
+			}
 			continue;
 		}
 
@@ -389,20 +370,53 @@ vrele(struct vnode *vp)
 		 */
 		if (count & VREF_FINALIZE) {
 			vx_lock(vp);
-			if (atomic_cmpset_int(&vp->v_refcnt,
-					      count, VREF_TERMINATE)) {
+			if (atomic_fcmpset_int(&vp->v_refcnt,
+					      &count, VREF_TERMINATE)) {
 				vnode_terminate(vp);
 				break;
 			}
 			vx_unlock(vp);
 		} else {
-			if (atomic_cmpset_int(&vp->v_refcnt, count, 0)) {
+			if (atomic_fcmpset_int(&vp->v_refcnt, &count, 0)) {
 				atomic_add_int(&mycpu->gd_cachedvnodes, 1);
 				break;
 			}
 		}
+		cpu_pause();
 		/* retry */
 	}
+#else
+	/*
+	 * XXX NOT YET WORKING!  Multiple threads can reference the vnode
+	 * after dropping their count, racing destruction, because this
+	 * code is not directly transitioning from 1->VREF_FINALIZE.
+	 */
+        /*
+         * Drop the ref-count.  On the 1->0 transition we check VREF_FINALIZE
+         * and attempt to acquire VREF_TERMINATE if set.  It is possible for
+         * concurrent vref/vrele to race and bounce 0->1, 1->0, etc, but
+         * only one will be able to transition the vnode into the
+         * VREF_TERMINATE state.
+         *
+         * NOTE: VREF_TERMINATE is *in* VREF_MASK, so the vnode may only enter
+         *       this state once.
+         */
+        count = atomic_fetchadd_int(&vp->v_refcnt, -1);
+        if ((count & VREF_MASK) == 1) {
+                atomic_add_int(&mycpu->gd_cachedvnodes, 1);
+                --count;
+                while ((count & (VREF_MASK | VREF_FINALIZE)) == VREF_FINALIZE) {
+                        vx_lock(vp);
+                        if (atomic_fcmpset_int(&vp->v_refcnt,
+                                               &count, VREF_TERMINATE)) {
+                                atomic_add_int(&mycpu->gd_cachedvnodes, -1);
+                                vnode_terminate(vp);
+                                break;
+                        }
+                        vx_unlock(vp);
+                }
+        }
+#endif
 }
 
 /*
@@ -487,12 +501,26 @@ void
 vx_lock(struct vnode *vp)
 {
 	lockmgr(&vp->v_lock, LK_EXCLUSIVE);
+	spin_lock_update_only(&vp->v_spin);
 }
 
 void
 vx_unlock(struct vnode *vp)
 {
+	spin_unlock_update_only(&vp->v_spin);
 	lockmgr(&vp->v_lock, LK_RELEASE);
+}
+
+/*
+ * Downgrades a VX lock to a normal VN lock.  The lock remains EXCLUSIVE.
+ *
+ * Generally required after calling getnewvnode() if the intention is
+ * to return a normal locked vnode to the caller.
+ */
+void
+vx_downgrade(struct vnode *vp)
+{
+	spin_unlock_update_only(&vp->v_spin);
 }
 
 /****************************************************************
@@ -566,12 +594,16 @@ vget(struct vnode *vp, int flags)
 		 * NOTE! Multiple threads may clear VINACTIVE if this is
 		 *	 shared lock.  This race is allowed.
 		 */
-		_vclrflags(vp, VINACTIVE);	/* SMP race ok */
-		vp->v_act += VACT_INC;
-		if (vp->v_act > VACT_MAX)	/* SMP race ok */
-			vp->v_act = VACT_MAX;
+		if (vp->v_flag & VINACTIVE)
+			_vclrflags(vp, VINACTIVE);	/* SMP race ok */
+		if (vp->v_act < VACT_MAX) {
+			vp->v_act += VACT_INC;
+			if (vp->v_act > VACT_MAX)	/* SMP race ok */
+				vp->v_act = VACT_MAX;
+		}
 		error = 0;
-		atomic_clear_int(&vp->v_refcnt, VREF_TERMINATE);
+		if (vp->v_refcnt & VREF_TERMINATE)	/* SMP race ok */
+			atomic_clear_int(&vp->v_refcnt, VREF_TERMINATE);
 	} else {
 		/*
 		 * If the vnode is not VS_ACTIVE it must be reactivated
@@ -674,6 +706,7 @@ vx_get(struct vnode *vp)
 	if ((atomic_fetchadd_int(&vp->v_refcnt, 1) & VREF_MASK) == 0)
 		atomic_add_int(&mycpu->gd_cachedvnodes, -1);
 	lockmgr(&vp->v_lock, LK_EXCLUSIVE);
+	spin_lock_update_only(&vp->v_spin);
 }
 
 int
@@ -685,6 +718,7 @@ vx_get_nonblock(struct vnode *vp)
 		return(EBUSY);
 	error = lockmgr(&vp->v_lock, LK_EXCLUSIVE | LK_NOWAIT);
 	if (error == 0) {
+		spin_lock_update_only(&vp->v_spin);
 		if ((atomic_fetchadd_int(&vp->v_refcnt, 1) & VREF_MASK) == 0)
 			atomic_add_int(&mycpu->gd_cachedvnodes, -1);
 	}
@@ -703,6 +737,7 @@ vx_put(struct vnode *vp)
 {
 	if (vp->v_type == VNON || vp->v_type == VBAD)
 		atomic_set_int(&vp->v_refcnt, VREF_FINALIZE);
+	spin_unlock_update_only(&vp->v_spin);
 	lockmgr(&vp->v_lock, LK_RELEASE);
 	vrele(vp);
 }
@@ -716,6 +751,7 @@ vx_put(struct vnode *vp)
  * periods of extreme vnode use.
  *
  * NOTE: The returned vnode is not completely initialized.
+ *	 The returned vnode will be VX locked.
  */
 static
 struct vnode *
@@ -851,7 +887,7 @@ skip:
 		 * ref on it.  This can occur if a filesystem temporarily
 		 * releases the vnode lock during VOP_RECLAIM.
 		 */
-		if (vp->v_auxrefs ||
+		if (vp->v_auxrefs != vp->v_namecache_count ||
 		    (vp->v_refcnt & ~VREF_FINALIZE) != VREF_TERMINATE + 1) {
 failed:
 			if (vp->v_state == VS_INACTIVE) {
@@ -874,6 +910,12 @@ failed:
 		 * changed while we hold the vx lock.
 		 *
 		 * Try to reclaim the vnode.
+		 *
+		 * The cache_inval_vp() can fail if any of the namecache
+		 * elements are actively locked, preventing the vnode from
+		 * bring reclaimed.  This is desired operation as it gives
+		 * the namecache code certain guarantees just by holding
+		 * a ncp.
 		 */
 		KKASSERT(vp->v_flag & VINACTIVE);
 		KKASSERT(vp->v_refcnt & VREF_TERMINATE);
@@ -1017,12 +1059,10 @@ allocvnode(int lktimeout, int lkflags)
 		if (vp->v_auxrefs ||
 		    (vp->v_refcnt & ~VREF_FINALIZE) != VREF_TERMINATE + 1) {
 			if (vp->v_state == VS_INACTIVE) {
-				if (vp->v_state == VS_INACTIVE) {
-					TAILQ_REMOVE(&vi->inactive_list,
-						     vp, v_list);
-					TAILQ_INSERT_TAIL(&vi->inactive_list,
-							  vp, v_list);
-				}
+				TAILQ_REMOVE(&vi->inactive_list,
+					     vp, v_list);
+				TAILQ_INSERT_TAIL(&vi->inactive_list,
+						  vp, v_list);
 			}
 			spin_unlock(&vi->spin);
 			vx_put(vp);
@@ -1075,6 +1115,7 @@ allocvnode(int lktimeout, int lkflags)
 		atomic_clear_int(&vp->v_refcnt, VREF_TERMINATE|VREF_FINALIZE);
 		KASSERT(vp->v_refcnt == 1,
 			("vp %p badrefs %08x", vp, vp->v_refcnt));
+		vx_unlock(vp);		/* safety: keep the API clean */
 		bzero(vp, sizeof(*vp));
 	} else {
 		spin_unlock(&vi->spin);
@@ -1091,7 +1132,7 @@ slower:
 	RB_INIT(&vp->v_rbhash_tree);
 	spin_init(&vp->v_spin, "allocvnode");
 
-	lockmgr(&vp->v_lock, LK_EXCLUSIVE);
+	vx_lock(vp);
 	vp->v_refcnt = 1;
 	vp->v_flag = VAGE0 | VAGE1;
 	vp->v_pbuf_count = nswbuf_kva / NSWBUF_SPLIT;

@@ -377,11 +377,13 @@ f_delete(PLAN *plan __unused, FTSENT *entry)
 			entry->fts_accpath);
 
 	/* Turn off user immutable bits if running as root */
+#ifdef _ST_FLAGS_PRESENT_
 	if ((entry->fts_statp->st_flags & (UF_APPEND|UF_IMMUTABLE)) &&
 	    !(entry->fts_statp->st_flags & (SF_APPEND|SF_IMMUTABLE)) &&
 	    geteuid() == 0)
 		lchflags(entry->fts_accpath,
 		       entry->fts_statp->st_flags &= ~(UF_APPEND|UF_IMMUTABLE));
+#endif
 
 	/* rmdir directories, unlink everything else */
 	if (S_ISDIR(entry->fts_statp->st_mode)) {
@@ -733,7 +735,11 @@ f_flags(PLAN *plan, FTSENT *entry)
 {
 	u_long flags;
 
+#ifdef _ST_FLAGS_PRESENT_
 	flags = entry->fts_statp->st_flags;
+#else
+	flags = 0;
+#endif
 	if (plan->flags & F_ATLEAST)
 		return (flags | plan->fl_flags) == flags &&
 		    !(flags & plan->fl_notflags);
@@ -750,7 +756,7 @@ c_flags(OPTION *option, char ***argvp)
 {
 	char *flags_str;
 	PLAN *new;
-	u_long flags, notflags;
+	u_long flags = 0, notflags = 0;
 
 	flags_str = nextarg(option, argvp);
 	ftsoptions &= ~FTS_NOSTAT;
@@ -764,8 +770,10 @@ c_flags(OPTION *option, char ***argvp)
 		new->flags |= F_ANY;
 		flags_str++;
 	}
+#ifdef _ST_FLAGS_PRESENT_
 	if (strtofflags(&flags_str, &flags, &notflags) == 1)
 		errx(1, "%s: %s: illegal flags string", option->name, flags_str);
+#endif
 
 	new->fl_flags = flags;
 	new->fl_notflags = notflags;
@@ -842,7 +850,9 @@ f_fstype(PLAN *plan, FTSENT *entry)
 		 * always copy both of them.
 		 */
 		val_flags = sb.f_flags;
+#ifndef BOOTSTRAPPING
 		val_type = sb.f_type;
+#endif
 	}
 	switch (plan->flags & F_MTMASK) {
 	case F_MTFLAG:
@@ -859,7 +869,9 @@ c_fstype(OPTION *option, char ***argvp)
 {
 	char *fsname;
 	PLAN *new;
+#ifndef BOOTSTRAPPING
 	struct vfsconf vfc;
+#endif
 
 	fsname = nextarg(option, argvp);
 	ftsoptions &= ~FTS_NOSTAT;
@@ -869,11 +881,13 @@ c_fstype(OPTION *option, char ***argvp)
 	/*
 	 * Check first for a filesystem name.
 	 */
+#ifndef BOOTSTRAPPING
 	if (getvfsbyname(fsname, &vfc) == 0) {
 		new->flags |= F_MTTYPE;
 		new->mt_data = vfc.vfc_typenum;
 		return new;
 	}
+#endif
 
 	switch (*fsname) {
 	case 'l':
@@ -1126,11 +1140,15 @@ c_newer(OPTION *option, char ***argvp)
 	new = palloc(option);
 	/* compare against what */
 	if (option->flags & F_TIME2_T) {
+#ifdef BOOTSTRAPPING
+		err(1, "disabled in BTOOLS");
+#else
 		new->t_data.tv_sec = get_date(fn_or_tspec);
 		if (new->t_data.tv_sec == (time_t) -1)
 			errx(1, "Can't parse date/time: %s", fn_or_tspec);
 		/* Use the seconds only in the comparison. */
 		new->t_data.tv_nsec = 999999999;
+#endif
 	} else {
 		if (stat(fn_or_tspec, &sb))
 			err(1, "%s", fn_or_tspec);
@@ -1515,7 +1533,7 @@ c_type(OPTION *option, char ***argvp)
 	case 's':
 		mask = S_IFSOCK;
 		break;
-#ifdef FTS_WHITEOUT
+#if defined(S_IFWHT) && defined(FTS_WHITEOUT)
 	case 'w':
 		mask = S_IFWHT;
 		ftsoptions |= FTS_WHITEOUT;

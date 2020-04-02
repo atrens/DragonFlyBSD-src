@@ -3,6 +3,7 @@
  * Copyright (c) 2010 iX Systems, Inc.
  * Copyright (c) 2010 Panasas, Inc.
  * Copyright (c) 2013, 2014 Mellanox Technologies, Ltd.
+ * Copyright (c) 2020 François Tigeot <ftigeot@wolfpond.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -51,3 +52,31 @@ kmemdup(const void *src, size_t len, gfp_t gfp)
 		memcpy(dst, src, len);
 	return (dst);
 }
+
+#include <linux/fb.h>
+
+struct fb_info *
+framebuffer_alloc(size_t size, struct device *dev)
+{
+	return kzalloc(sizeof(struct fb_info), GFP_KERNEL);
+}
+
+void
+framebuffer_release(struct fb_info *info)
+{
+	kfree(info);
+}
+
+#include <asm/processor.h>
+
+struct cpuinfo_x86 boot_cpu_data;
+
+static int
+init_boot_cpu_data(void *arg)
+{
+	boot_cpu_data.x86_clflush_size = cpu_clflush_line_size;
+
+	return 0;
+}
+
+SYSINIT(boot_cpu_data_init, SI_SUB_DRIVERS, SI_ORDER_MIDDLE, init_boot_cpu_data, NULL);

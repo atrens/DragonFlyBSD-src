@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018 François Tigeot
+ * Copyright (c) 2018-2019 François Tigeot <ftigeot@wolfpond.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -42,6 +42,8 @@ struct irq_data {
 	struct			lwkt_serialize irq_lock;
 	SLIST_ENTRY(irq_data)	id_irq_entries;
 };
+
+struct lock irqdata_lock = LOCK_INITIALIZER("dlidl", 0, LK_CANRECURSE);
 
 SLIST_HEAD(irq_data_list_head, irq_data) irq_list = SLIST_HEAD_INITIALIZER(irq_list);
 
@@ -89,7 +91,9 @@ request_irq(unsigned int irq, irq_handler_t handler,
 		kfree(irq_entry);
 		return -error;
 	}
+	lockmgr(&irqdata_lock, LK_EXCLUSIVE);
 	SLIST_INSERT_HEAD(&irq_list, irq_entry, id_irq_entries);
+	lockmgr(&irqdata_lock, LK_RELEASE);
 
 	return 0;
 }
@@ -122,6 +126,48 @@ free_irq(unsigned int irq, void *dev_id)
 	if (ddev->pdev->_irq_type == PCI_INTR_TYPE_MSI)
 		pci_release_msi(bsddev);
 
+	lockmgr(&irqdata_lock, LK_EXCLUSIVE);
 	SLIST_REMOVE(&irq_list, irq_entry, irq_data, id_irq_entries);
+	lockmgr(&irqdata_lock, LK_RELEASE);
 	kfree(irq_entry);
+}
+
+void
+disable_irq(unsigned int irq)
+{
+	struct irq_data *irq_entry;
+	struct drm_device *ddev;
+	device_t bsddev;
+
+	SLIST_FOREACH(irq_entry, &irq_list, id_irq_entries) {
+		if (irq_entry->irq == irq)
+			break;
+	}
+
+	kprintf("disabling irq %d\n", irq);
+
+	ddev = irq_entry->dev_id;
+	bsddev = ddev->dev->bsddev;
+	bus_teardown_intr(bsddev, irq_entry->resource, irq_entry->cookiep);
+}
+
+void
+enable_irq(unsigned int irq)
+{
+	struct irq_data *irq_entry;
+	struct drm_device *ddev;
+	device_t bsddev;
+
+	SLIST_FOREACH(irq_entry, &irq_list, id_irq_entries) {
+		if (irq_entry->irq == irq)
+			break;
+	}
+
+	kprintf("enabling irq %d\n", irq);
+
+	ddev = irq_entry->dev_id;
+	bsddev = ddev->dev->bsddev;
+	bus_setup_intr(bsddev, irq_entry->resource, INTR_MPSAFE,
+	    linux_irq_handler, irq_entry, &irq_entry->cookiep,
+	    &irq_entry->irq_lock);
 }

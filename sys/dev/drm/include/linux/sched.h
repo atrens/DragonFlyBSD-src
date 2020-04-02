@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015-2019 François Tigeot <ftigeot@wolfpond.org>
+ * Copyright (c) 2015-2020 François Tigeot <ftigeot@wolfpond.org>
  * Copyright (c) 2019 Matthew Dillon <dillon@backplane.com>
  * All rights reserved.
  *
@@ -34,6 +34,7 @@
 #include <linux/types.h>
 #include <linux/jiffies.h>
 #include <linux/rbtree.h>
+#include <linux/thread_info.h>
 #include <linux/cpumask.h>
 #include <linux/errno.h>
 #include <linux/mm_types.h>
@@ -41,6 +42,7 @@
 
 #include <asm/page.h>
 
+#include <linux/smp.h>
 #include <linux/compiler.h>
 #include <linux/completion.h>
 #include <linux/pid.h>
@@ -62,6 +64,8 @@
 #include <sys/sched.h>
 #include <sys/signal2.h>
 
+#include <machine/cpu.h>
+
 struct seq_file;
 
 #define	TASK_RUNNING		0
@@ -71,6 +75,28 @@ struct seq_file;
 #define TASK_NORMAL		(TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE)
 
 #define MAX_SCHEDULE_TIMEOUT    LONG_MAX
+
+struct task_struct {
+	struct thread *dfly_td;
+	volatile long state;
+	struct mm_struct *mm;	/* mirror copy in p->p_linux_mm */
+	int prio;
+
+	/* kthread-specific data */
+	unsigned long		kt_flags;
+	struct completion	kt_exited;
+	int			(*kt_fn)(void *data);
+	void			*kt_fndata;
+	int			kt_exitvalue;
+};
+
+#define __set_current_state(state_value)	current->state = (state_value);
+
+#define set_current_state(state_value)		\
+do {						\
+	__set_current_state(state_value);	\
+	mb();					\
+} while (0)
 
 /*
  * schedule_timeout: puts the current thread to sleep until timeout
@@ -125,6 +151,19 @@ done:
 	return ret;
 }
 
+static inline void
+schedule(void)
+{
+	(void)schedule_timeout(MAX_SCHEDULE_TIMEOUT);
+}
+
+static inline signed long
+schedule_timeout_uninterruptible(signed long timeout)
+{
+	__set_current_state(TASK_UNINTERRUPTIBLE);
+	return schedule_timeout(timeout);
+}
+
 static inline long
 io_schedule_timeout(signed long timeout)
 {
@@ -150,14 +189,6 @@ yield(void)
 {
 	lwkt_yield();
 }
-
-#define __set_current_state(state_value)	current->state = (state_value);
-
-#define set_current_state(state_value)		\
-do {						\
-	__set_current_state(state_value);	\
-	mb();					\
-} while (0)
 
 static inline int
 wake_up_process(struct task_struct *tsk)
@@ -225,6 +256,26 @@ set_need_resched(void)
 {
 	/* do nothing for now */
 	/* used on ttm_bo_reserve failures */
+}
+
+static inline bool
+need_resched(void)
+{
+	return any_resched_wanted();
+}
+
+static inline int
+sched_setscheduler_nocheck(struct task_struct *ts,
+			   int policy, const struct sched_param *param)
+{
+	/* We do not allow different thread scheduling policies */
+	return 0;
+}
+
+static inline int
+pagefault_disabled(void)
+{
+	return (curthread->td_flags & TDF_NOFAULT);
 }
 
 #endif	/* _LINUX_SCHED_H_ */

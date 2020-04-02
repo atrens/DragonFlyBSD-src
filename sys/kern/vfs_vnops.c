@@ -102,6 +102,7 @@ vn_open(struct nlookupdata *nd, struct file *fp, int fmode, int cmode)
 	struct vattr vat;
 	struct vattr *vap = &vat;
 	int error;
+	int vpexcl;
 	u_int flags;
 	uint64_t osize;
 	struct mount *mp;
@@ -161,12 +162,24 @@ vn_open(struct nlookupdata *nd, struct file *fp, int fmode, int cmode)
 	/*
 	 * split case to allow us to re-resolve and retry the ncp in case
 	 * we get ESTALE.
+	 *
+	 * (error is 0 on entry / retry)
 	 */
 again:
+	/*
+	 * Checks for (likely) filesystem-modifying cases and allows
+	 * the filesystem to stall the front-end.
+	 */
+	if ((fmode & (FWRITE | O_TRUNC)) ||
+	    ((fmode & O_CREAT) && nd->nl_nch.ncp->nc_vp == NULL)) {
+		error = ncp_writechk(&nd->nl_nch);
+		if (error)
+			return error;
+	}
+
+	vpexcl = 1;
 	if (fmode & O_CREAT) {
 		if (nd->nl_nch.ncp->nc_vp == NULL) {
-			if ((error = ncp_writechk(&nd->nl_nch)) != 0)
-				return (error);
 			VATTR_NULL(vap);
 			vap->va_type = VREG;
 			vap->va_mode = cmode;
@@ -191,8 +204,22 @@ again:
 			fmode &= ~O_CREAT;
 		}
 	} else {
-		if (nd->nl_flags & NLC_SHAREDLOCK) {
+		/*
+		 * In most other cases a shared lock on the vnode is
+		 * sufficient.  However, the O_RDWR case needs an
+		 * exclusive lock if the vnode is executable.  The
+		 * NLC_EXCLLOCK_IFEXEC and NCF_NOTX flags help resolve
+		 * this.
+		 *
+		 * NOTE: If NCF_NOTX is not set, we do not know the
+		 *	 the state of the 'x' bits and have to get
+		 *	 an exclusive lock for the EXCLLOCK_IFEXEC case.
+		 */
+		if ((nd->nl_flags & NLC_SHAREDLOCK) &&
+		    ((nd->nl_flags & NLC_EXCLLOCK_IFEXEC) == 0 ||
+		     nd->nl_nch.ncp->nc_flag & NCF_NOTX)) {
 			error = cache_vget(&nd->nl_nch, cred, LK_SHARED, &vp);
+			vpexcl = 0;
 		} else {
 			error = cache_vget(&nd->nl_nch, cred,
 					   LK_EXCLUSIVE, &vp);
@@ -223,7 +250,12 @@ again:
 				error = EISDIR;
 				goto bad;
 			}
-			error = vn_writechk(vp, &nd->nl_nch);
+
+			/*
+			 * Additional checks on vnode (does not substitute
+			 * for ncp_writechk()).
+			 */
+			error = vn_writechk(vp);
 			if (error) {
 				/*
 				 * Special stale handling, re-resolve the
@@ -232,7 +264,7 @@ again:
 				if (error == ESTALE) {
 					vput(vp);
 					vp = NULL;
-					if (nd->nl_flags & NLC_SHAREDLOCK) {
+					if (vpexcl == 0) {
 						cache_unlock(&nd->nl_nch);
 						cache_lock(&nd->nl_nch);
 					}
@@ -367,10 +399,15 @@ vn_opendisk(const char *devname, int fmode, struct vnode **vpp)
 }
 
 /*
- * Check for write permissions on the specified vnode.  nch may be NULL.
+ * Checks for special conditions on the vnode which might prevent writing
+ * after the vnode has (likely) been locked.  The vnode might or might not
+ * be locked as of this call, but will be at least referenced.
+ *
+ * Also re-checks the mount RDONLY flag that ncp_writechk() checked prior
+ * to the vnode being locked.
  */
 int
-vn_writechk(struct vnode *vp, struct nchandle *nch)
+vn_writechk(struct vnode *vp)
 {
 	/*
 	 * If there's shared text associated with
@@ -379,18 +416,9 @@ vn_writechk(struct vnode *vp, struct nchandle *nch)
 	 */
 	if (vp->v_flag & VTEXT)
 		return (ETXTBSY);
-
-	/*
-	 * If the vnode represents a regular file, check the mount
-	 * point via the nch.  This may be a different mount point
-	 * then the one embedded in the vnode (e.g. nullfs).
-	 *
-	 * We can still write to non-regular files (e.g. devices)
-	 * via read-only mounts.
-	 */
-	if (nch && nch->ncp && vp->v_type == VREG)
-		return (ncp_writechk(nch));
-	return (0);
+	if (vp->v_mount && (vp->v_mount->mnt_flag & MNT_RDONLY))
+		return (EROFS);
+	return 0;
 }
 
 /*
@@ -398,6 +426,8 @@ vn_writechk(struct vnode *vp, struct nchandle *nch)
  * referenced by the namecache may be different from the mount point
  * used by the underlying vnode in the case of NULLFS, so a separate
  * check is needed.
+ *
+ * Must be called PRIOR to any vnodes being locked.
  */
 int
 ncp_writechk(struct nchandle *nch)
@@ -767,6 +797,9 @@ vn_stat(struct vnode *vp, struct stat *sb, struct ucred *cred)
 	u_short mode;
 	cdev_t dev;
 
+	/*
+	 * vp already has a ref and is validated, can call unlocked.
+	 */
 	vap = &vattr;
 	error = VOP_GETATTR(vp, vap);
 	if (error)
@@ -827,7 +860,7 @@ vn_stat(struct vnode *vp, struct stat *sb, struct ucred *cred)
 		sb->st_nlink = vap->va_nlink;
 	sb->st_uid = vap->va_uid;
 	sb->st_gid = vap->va_gid;
-	sb->st_rdev = dev2udev(vp->v_rdev);
+	sb->st_rdev = devid_from_dev(vp->v_rdev);
 	sb->st_size = vap->va_size;
 	sb->st_atimespec = vap->va_atime;
 	sb->st_mtimespec = vap->va_mtime;
@@ -1020,6 +1053,20 @@ vn_lock(struct vnode *vp, int flags)
 		}
 	}
 	return (error);
+}
+
+int
+vn_relock(struct vnode *vp, int flags)
+{
+	int error;
+
+	do {
+		error = lockmgr(&vp->v_lock, flags);
+		if (error == 0)
+			break;
+	} while (flags & LK_RETRY);
+
+	return error;
 }
 
 #ifdef DEBUG_VN_UNLOCK

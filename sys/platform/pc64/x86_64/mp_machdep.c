@@ -535,6 +535,8 @@ start_all_aps(u_int boot_addr)
 	mycpu->gd_other_cpus = smp_startup_mask;
 	CPUMASK_NANDBIT(mycpu->gd_other_cpus, mycpu->gd_cpuid);
 
+	malloc_reinit_ncpus();
+
 	gd = (struct mdglobaldata *)mycpu;
 	gd->gd_acpi_id = CPUID_TO_ACPIID(mycpu->gd_cpuid);
 
@@ -1088,6 +1090,9 @@ smp_invlpg(cpumask_t *cmdmask)
 	smp_inval_intr();
 }
 
+/*
+ * Issue rip/rsp sniffs
+ */
 void
 smp_sniff(void)
 {

@@ -55,7 +55,6 @@
 #include <sys/thread2.h>
 #include <sys/msgport2.h>
 #include <net/netmsg2.h>
-#include <sys/mplock2.h>
 
 #include <vm/vm_extern.h>
 
@@ -123,11 +122,11 @@ static int (*netmsg_fwd_port_fn)(lwkt_port_t, lwkt_msg_t);
 
 SYSCTL_NODE(_net, OID_AUTO, netisr, CTLFLAG_RW, 0, "netisr");
 
-static int netisr_rollup_limit = 32;
+__read_frequently static int netisr_rollup_limit = 32;
 SYSCTL_INT(_net_netisr, OID_AUTO, rollup_limit, CTLFLAG_RW,
 	&netisr_rollup_limit, 0, "Message to process before rollup");
 
-int netisr_ncpus;
+__read_frequently int netisr_ncpus;
 TUNABLE_INT("net.netisr.ncpus", &netisr_ncpus);
 SYSCTL_INT(_net_netisr, OID_AUTO, ncpus, CTLFLAG_RD,
 	&netisr_ncpus, 0, "# of CPUs to handle network messages");

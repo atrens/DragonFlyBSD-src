@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015-2019 François Tigeot <ftigeot@wolfpond.org>
+ * Copyright (c) 2015-2020 François Tigeot <ftigeot@wolfpond.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -28,10 +28,13 @@
 #define _LINUX_SPINLOCK_H_
 
 #include <linux/preempt.h>
+#include <linux/linkage.h>
 #include <linux/compiler.h>
 #include <linux/irqflags.h>
+#include <linux/thread_info.h>
 #include <linux/kernel.h>
 #include <linux/stringify.h>
+#include <linux/bottom_half.h>
 #include <asm/barrier.h>
 
 #include <linux/rwlock.h>
@@ -42,6 +45,8 @@
 #define spin_is_locked(x)	spin_held(x)
 
 #define assert_spin_locked(x)	KKASSERT(lockinuse(x))
+
+typedef struct lock spinlock_t;
 
 /*
  * The spin_lock_irq() family of functions stop hardware interrupts
@@ -76,7 +81,9 @@ spin_unlock_bh(struct lock *lock)
 	spin_unlock_irq(lock);
 }
 
-#define DEFINE_SPINLOCK(x) \
-	struct spinlock x = SPINLOCK_INITIALIZER(x, "ds##x")
+#define DEFINE_SPINLOCK(x)	struct lock x = LOCK_INITIALIZER("ds##x", 0, 0)
+
+#define spin_lock_irqsave_nested(lock, flags, subclass)	\
+	    spin_lock_irqsave(lock, flags)
 
 #endif	/* _LINUX_SPINLOCK_H_ */

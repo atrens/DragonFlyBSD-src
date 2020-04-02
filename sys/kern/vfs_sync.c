@@ -53,7 +53,6 @@
 #include <sys/mbuf.h>
 #include <sys/mount.h>
 #include <sys/proc.h>
-#include <sys/namei.h>
 #include <sys/reboot.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -343,8 +342,12 @@ vn_syncer_thr_stop(struct mount *mp)
 	wakeup(ctx);
 	
 	/* Wait till syncer process exits */
-	while ((ctx->sc_flags & SC_FLAG_DONE) == 0) 
-		tsleep(&ctx->sc_flags, 0, "syncexit", hz);
+	while ((ctx->sc_flags & SC_FLAG_DONE) == 0) {
+		tsleep_interlock(&ctx->sc_flags, 0);
+		lwkt_reltoken(&ctx->sc_token);
+		tsleep(&ctx->sc_flags, PINTERLOCKED, "syncexit", hz);
+		lwkt_gettoken(&ctx->sc_token);
+	}
 
 	mp->mnt_syncer_ctx = NULL;
 	lwkt_reltoken(&ctx->sc_token);
@@ -389,7 +392,8 @@ syncer_thread(void *_ctx)
 
 		/*
 		 * If syncer_trigger is set (from trigger_syncer(mp)),
-		 * Immediately do a full filesystem sync.
+		 * Immediately do a full filesystem sync and set up the
+		 * following full filesystem sync to occur in 1 second.
 		 */
 		if (ctx->syncer_trigger) {
 			ctx->syncer_trigger = 0;
@@ -406,6 +410,9 @@ syncer_thread(void *_ctx)
 			}
 		}
 
+		/*
+		 * FSYNC items in this bucket
+		 */
 		while ((vp = LIST_FIRST(slp)) != NULL) {
 			vn_syncer_add(vp, retrydelay);
 			if (ctx->syncer_forced) {
@@ -424,7 +431,8 @@ syncer_thread(void *_ctx)
 		}
 
 		/*
-		 * Increment the slot upon completion.
+		 * Increment the slot upon completion.  This is typically
+		 * one-second but may be faster if the syncer is triggered.
 		 */
 		ctx->syncer_delayno = (ctx->syncer_delayno + 1) &
 				      ctx->syncer_mask;
@@ -466,15 +474,18 @@ syncer_thread(void *_ctx)
 		}
 
 		/*
-		 * If it has taken us less than a second to process the
-		 * current work, then wait. Otherwise start right over
-		 * again. We can still lose time if any single round
-		 * takes more than two seconds, but it does not really
-		 * matter as we are just trying to generally pace the
-		 * filesystem activity.
+		 * Normal syncer operation iterates once a second, unless
+		 * specifically triggered.
 		 */
-		if (time_uptime == starttime)
-			tsleep(ctx, 0, "syncer", hz);
+		if (time_uptime == starttime &&
+		    ctx->syncer_trigger == 0) {
+			tsleep_interlock(ctx, 0);
+			if (time_uptime == starttime &&
+			    ctx->syncer_trigger == 0 &&
+			    (ctx->sc_flags & SC_FLAG_EXIT) == 0) {
+				tsleep(ctx, PINTERLOCKED, "syncer", hz);
+			}
+		}
 	}
 
 	/*

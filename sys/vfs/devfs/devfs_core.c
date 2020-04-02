@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009 The DragonFly Project.  All rights reserved.
+ * Copyright (c) 2009-2019 The DragonFly Project.  All rights reserved.
  *
  * This code is derived from software contributed to The DragonFly Project
  * by Alex Hornung <ahornung@gmail.com>
@@ -109,6 +109,8 @@ static int	devfs_debug_enable;
 static int	devfs_run;
 
 static ino_t devfs_fetch_ino(void);
+static int devfs_reference_ops(struct dev_ops *ops);
+static void devfs_release_ops(struct dev_ops *ops);
 static int devfs_create_all_dev_worker(struct devfs_node *);
 static int devfs_create_dev_worker(cdev_t, uid_t, gid_t, int);
 static int devfs_destroy_dev_worker(cdev_t);
@@ -125,7 +127,7 @@ static void devfs_msg_autofree_reply(lwkt_port_t, lwkt_msg_t);
 static void devfs_msg_core(void *);
 
 static int devfs_find_device_by_name_worker(devfs_msg_t);
-static int devfs_find_device_by_udev_worker(devfs_msg_t);
+static int devfs_find_device_by_devid_worker(devfs_msg_t);
 
 static int devfs_apply_reset_rules_caller(char *, int);
 
@@ -256,7 +258,7 @@ devfs_allocp(devfs_nodetype devfsnodetype, char *name,
 	node->parent = parent;
 
 	/* Initialize *time members */
-	nanotime(&node->atime);
+	vfs_timestamp(&node->atime);
 	node->mtime = node->ctime = node->atime;
 
 	/*
@@ -381,6 +383,7 @@ try_again:
 	default:
 		panic("devfs_allocv: unknown node type");
 	}
+	vx_downgrade(vp);	/* downgrade VX lock to VN lock */
 
 out:
 	return error;
@@ -449,15 +452,6 @@ devfs_freep(struct devfs_node *node)
 		} else {
 			kprintf("devfs: race avoided node '%s' (%p)\n",
 				node->d_dir.d_name, node);
-#if 0
-			if (lockstatus(&devfs_lock, curthread) == LK_EXCLUSIVE) {
-				lockmgr(&devfs_lock, LK_RELEASE);
-				Debugger("devfs1");
-				lockmgr(&devfs_lock, LK_EXCLUSIVE);
-			} else {
-				Debugger("devfs2");
-			}
-#endif
 		}
 		return;
 	}
@@ -939,24 +933,24 @@ devfs_find_device_by_name(const char *fmt, ...)
 }
 
 /*
- * devfs_find_device_by_udev is the synchronous entry point to find a
+ * devfs_find_device_by_devid is the synchronous entry point to find a
  * device given its udev number.  It sends a synchronous message with
  * the relevant details to the devfs core and returns the answer.
  */
 cdev_t
-devfs_find_device_by_udev(udev_t udev)
+devfs_find_device_by_devid(dev_t udev)
 {
 	cdev_t found = NULL;
 	devfs_msg_t msg;
 
 	msg = devfs_msg_get();
 	msg->mdv_udev = udev;
-	devfs_msg_send_sync(DEVFS_FIND_DEVICE_BY_UDEV, msg);
+	devfs_msg_send_sync(DEVFS_FIND_DEVICE_BY_DEVID, msg);
 	found = msg->mdv_cdev;
 	devfs_msg_put(msg);
 
 	devfs_debug(DEVFS_DEBUG_DEBUG,
-		    "devfs_find_device_by_udev found? %s  -end:3-\n",
+		    "devfs_find_device_by_devid found? %s  -end:3-\n",
 		    ((found) ? found->si_name:"NO"));
 	return found;
 }
@@ -1349,8 +1343,8 @@ devfs_msg_exec(devfs_msg_t msg)
 	case DEVFS_FIND_DEVICE_BY_NAME:
 		devfs_find_device_by_name_worker(msg);
 		break;
-	case DEVFS_FIND_DEVICE_BY_UDEV:
-		devfs_find_device_by_udev_worker(msg);
+	case DEVFS_FIND_DEVICE_BY_DEVID:
+		devfs_find_device_by_devid_worker(msg);
 		break;
 	case DEVFS_MAKE_ALIAS:
 		devfs_make_alias_worker((struct devfs_alias *)msg->mdv_load);
@@ -1662,13 +1656,13 @@ devfs_find_device_by_name_worker(devfs_msg_t devfs_msg)
  * the answer is returned to the caller.
  */
 static int
-devfs_find_device_by_udev_worker(devfs_msg_t devfs_msg)
+devfs_find_device_by_devid_worker(devfs_msg_t devfs_msg)
 {
 	cdev_t dev, dev1;
 	cdev_t found = NULL;
 
 	TAILQ_FOREACH_MUTABLE(dev, &devfs_dev_list, link, dev1) {
-		if (((udev_t)dev->si_inode) == devfs_msg->mdv_udev) {
+		if (((dev_t)dev->si_inode) == devfs_msg->mdv_udev) {
 			found = dev;
 			break;
 		}
@@ -2126,7 +2120,7 @@ devfs_create_device_node(struct devfs_node *root, cdev_t dev,
 	}
 
 	node = devfs_allocp(Ndev, name, parent, parent->mp, dev);
-	nanotime(&parent->mtime);
+	vfs_timestamp(&parent->mtime);
 
 	/*
 	 * Ugly unix98 pty magic, to hide pty master (ptm) devices and their
@@ -2262,7 +2256,7 @@ devfs_destroy_node(struct devfs_node *root, char *target)
 	node = devfs_find_device_node_by_name(parent, name);
 
 	if (node) {
-		nanotime(&node->parent->mtime);
+		vfs_timestamp(&node->parent->mtime);
 		devfs_gc(node);
 	}
 
@@ -2450,6 +2444,8 @@ devfs_new_cdev(struct dev_ops *ops, int minor, struct dev_ops *bops)
 	reference_dev(dev);
 	bzero(dev, offsetof(struct cdev, si_sysref));
 
+	lockmgr(&devfs_lock, LK_EXCLUSIVE);
+
 	dev->si_uid = 0;
 	dev->si_gid = 0;
 	dev->si_perms = 0;
@@ -2477,10 +2473,12 @@ devfs_new_cdev(struct dev_ops *ops, int minor, struct dev_ops *bops)
 	}
 
 	/* If there is a backing device, we reference its ops */
-	dev->si_inode = makeudev(
-		    devfs_reference_ops((bops)?(bops):(ops)),
-		    minor );
+	if (bops == NULL)
+		bops = ops;
+	dev->si_inode = makeudev(devfs_reference_ops(bops), minor);
 	dev->si_umajor = umajor(dev->si_inode);
+
+	lockmgr(&devfs_lock, LK_RELEASE);
 
 	return dev;
 }
@@ -2488,14 +2486,6 @@ devfs_new_cdev(struct dev_ops *ops, int minor, struct dev_ops *bops)
 static void
 devfs_cdev_terminate(cdev_t dev)
 {
-	int locked = 0;
-
-	/* Check if it is locked already. if not, we acquire the devfs lock */
-	if ((lockstatus(&devfs_lock, curthread)) != LK_EXCLUSIVE) {
-		lockmgr(&devfs_lock, LK_EXCLUSIVE);
-		locked = 1;
-	}
-
 	/*
 	 * Make sure the node isn't linked anymore. Otherwise we've screwed
 	 * up somewhere, since normal devs are unlinked on the call to
@@ -2506,12 +2496,11 @@ devfs_cdev_terminate(cdev_t dev)
 	 */
 	KKASSERT((dev->si_flags & SI_DEVFS_LINKED) == 0);
 
-	/* If we acquired the lock, we also get rid of it */
-	if (locked)
-		lockmgr(&devfs_lock, LK_RELEASE);
-
 	/* If there is a backing device, we release the backing device's ops */
 	devfs_release_ops((dev->si_bops)?(dev->si_bops):(dev->si_ops));
+
+	/* devfs_cdev_unlock() is not called, unlock ourselves */
+	lockmgr(&devfs_lock, LK_RELEASE);
 
 	/* Finally destroy the device */
 	sysref_put(&dev->si_sysref);
@@ -2523,11 +2512,13 @@ devfs_cdev_terminate(cdev_t dev)
 static void
 devfs_cdev_lock(cdev_t dev)
 {
+	lockmgr(&devfs_lock, LK_EXCLUSIVE);
 }
 
 static void
 devfs_cdev_unlock(cdev_t dev)
 {
+	lockmgr(&devfs_lock, LK_RELEASE);
 }
 
 static int
@@ -2612,7 +2603,10 @@ devfs_node_is_accessible(struct devfs_node *node)
 		return 0;
 }
 
-int
+/*
+ * devfs must be locked
+ */
+static int
 devfs_reference_ops(struct dev_ops *ops)
 {
 	int unit;
@@ -2627,7 +2621,8 @@ devfs_reference_ops(struct dev_ops *ops)
 	}
 
 	if (!found) {
-		found = kmalloc(sizeof(struct devfs_dev_ops), M_DEVFS, M_WAITOK);
+		found = kmalloc(sizeof(struct devfs_dev_ops),
+				M_DEVFS, M_WAITOK);
 		found->ops = ops;
 		found->ref_count = 0;
 		TAILQ_INSERT_TAIL(&devfs_dev_ops_list, found, link);
@@ -2636,11 +2631,13 @@ devfs_reference_ops(struct dev_ops *ops)
 	KKASSERT(found);
 
 	if (found->ref_count == 0) {
-		found->id = devfs_clone_bitmap_get(&DEVFS_CLONE_BITMAP(ops_id), 255);
+		found->id =
+		    devfs_clone_bitmap_get(&DEVFS_CLONE_BITMAP(ops_id), 255);
 		if (found->id == -1) {
 			/* Ran out of unique ids */
 			devfs_debug(DEVFS_DEBUG_WARNING,
-					"devfs_reference_ops: WARNING: ran out of unique ids\n");
+				    "devfs_reference_ops: WARNING: ran "
+				    "out of unique ids\n");
 		}
 	}
 	unit = found->id;
@@ -2649,7 +2646,10 @@ devfs_reference_ops(struct dev_ops *ops)
 	return unit;
 }
 
-void
+/*
+ * devfs must be locked
+ */
+static void
 devfs_release_ops(struct dev_ops *ops)
 {
 	struct devfs_dev_ops *found = NULL;
@@ -2668,7 +2668,9 @@ devfs_release_ops(struct dev_ops *ops)
 
 	if (found->ref_count == 0) {
 		TAILQ_REMOVE(&devfs_dev_ops_list, found, link);
+		lockmgr(&devfs_lock, LK_RELEASE);
 		devfs_clone_bitmap_put(&DEVFS_CLONE_BITMAP(ops_id), found->id);
+		lockmgr(&devfs_lock, LK_EXCLUSIVE);
 		kfree(found, M_DEVFS);
 	}
 }
@@ -2724,7 +2726,7 @@ devfs_init(void)
 	lwkt_initport_replyonly(&devfs_dispose_port, devfs_msg_autofree_reply);
 
 	/* Initialize *THE* devfs lock */
-	lockinit(&devfs_lock, "devfs_core lock", 0, 0);
+	lockinit(&devfs_lock, "devfs_core lock", 0, LK_CANRECURSE);
 	lwkt_token_init(&devfs_token, "devfs_core");
 
 	lockmgr(&devfs_lock, LK_EXCLUSIVE);
@@ -2768,11 +2770,11 @@ devfs_uninit(void)
 static int
 devfs_sysctl_devname_helper(SYSCTL_HANDLER_ARGS)
 {
-	udev_t 	udev;
+	dev_t 	udev;
 	cdev_t	found;
 	int		error;
 
-	if ((error = SYSCTL_IN(req, &udev, sizeof(udev_t))))
+	if ((error = SYSCTL_IN(req, &udev, sizeof(dev_t))))
 		return (error);
 
 	devfs_debug(DEVFS_DEBUG_DEBUG,
@@ -2781,7 +2783,7 @@ devfs_sysctl_devname_helper(SYSCTL_HANDLER_ARGS)
 	if (udev == NOUDEV)
 		return(EINVAL);
 
-	if ((found = devfs_find_device_by_udev(udev)) == NULL)
+	if ((found = devfs_find_device_by_devid(udev)) == NULL)
 		return(ENOENT);
 
 	return(SYSCTL_OUT(req, found->si_name, strlen(found->si_name) + 1));

@@ -69,9 +69,9 @@ static char *buildskipreason(pkglink_t *parent, pkg_t *pkg);
 static int buildskipcount_dueto(pkg_t *pkg, int mode);
 static int mptylogpoll(int ptyfd, int fdlog, wmsg_t *wmsg,
 			time_t *wdog_timep);
-static int copyfile(char *src, char *dst);
 static void doHook(pkg_t *pkg, const char *id, const char *path, int waitfor);
 static void childHookRun(bulk_t *bulk);
+static void adjloadavg(double *dload);
 
 static worker_t *SigWork;
 static int MasterPtyFd = -1;
@@ -304,7 +304,7 @@ DoBuild(pkg_t *pkgs)
 	}
 	pthread_mutex_unlock(&WorkerMutex);
 
-	RunStatsUpdateTop();
+	RunStatsUpdateTop(0);
 	RunStatsUpdateLogs();
 	RunStatsSync();
 	RunStatsDone();
@@ -392,12 +392,19 @@ build_find_leaves(pkg_t *parent, pkg_t *pkg, pkg_t ***build_tailp,
 		 * only on the default flavor which is only the first node
 		 * under this one, not all of them.
 		 *
+		 * DUMMY nodes can be marked SUCCESS so the build skips past
+		 * them, but this doesn't mean that their sub-nodes succeeded.
+		 * We have to check, so recurse even if it is marked
+		 * successful.
+		 *
 		 * NOTE: The depth is not being for complex dependency type
 		 *	 tests like it is in childInstallPkgDeps_recurse(),
 		 *	 so we don't have to hicup it like we do in that
 		 *	 procedure.
 		 */
 		dfirst_one_only = (scan->flags & PKGF_DUMMY) ? 1 : 0;
+		if (dfirst_one_only)
+			goto skip_to_flavor;
 
 		/*
 		 * When accounting for a successful build, just bump
@@ -469,6 +476,7 @@ build_find_leaves(pkg_t *parent, pkg_t *pkg, pkg_t ***build_tailp,
 				break;
 			continue;
 		}
+skip_to_flavor:
 
 		/*
 		 * Assert on dependency loop
@@ -578,17 +586,28 @@ build_find_leaves(pkg_t *parent, pkg_t *pkg, pkg_t ***build_tailp,
 		 * sub-depends (flavors) complete successfully.  Note that
 		 * dummy packages are not counted in the total, so do not
 		 * decrement BuildTotal.
+		 *
+		 * Do not propagate *app up for the dummy node.  If there
+		 * is a generic dependency (i.e. no flavor specified), the
+		 * upper recursion detects PKGF_DUMMY and traverses through
+		 * to the default flavor without checking error/nobuild
+		 * flags.
 		 */
-		ddprintf(depth, "} (DUMMY/META - SUCCESS)\n");
-		pkg->flags |= PKGF_SUCCESS;
-		*hasworkp = 1;
-		if (first) {
-			dlog(DLOG_ALL | DLOG_FILTER,
-			     "[XXX] %s META-ALREADY-BUILT\n",
-			     pkg->portdir);
+		if (pkg->flags & PKGF_NOBUILD) {
+			ddprintf(depth, "} (DUMMY/META - IGNORED)\n");
 		} else {
-			dlog(DLOG_SUCC, "[XXX] %s meta-node complete\n",
-			     pkg->portdir);
+			ddprintf(depth, "} (DUMMY/META - SUCCESS)\n");
+			pkg->flags |= PKGF_SUCCESS;
+			*hasworkp = 1;
+			if (first) {
+				dlog(DLOG_ALL | DLOG_FILTER,
+				     "[XXX] %s META-ALREADY-BUILT\n",
+				     pkg->portdir);
+			} else {
+				dlog(DLOG_SUCC, "[XXX] %s meta-node complete\n",
+				     pkg->portdir);
+				RunStatsUpdateCompletion(NULL, DLOG_SUCC, pkg, "");
+			}
 		}
 	} else if (pkg->flags & PKGF_PACKAGED) {
 		/*
@@ -804,12 +823,16 @@ startbuild(pkg_t **build_listp, pkg_t ***build_tailp)
 				++BuildIgnoreCount;
 				dlog(DLOG_IGN, "[XXX] %s ignored due to %s\n",
 				     ipkg->portdir, reason);
+				RunStatsUpdateCompletion(NULL, DLOG_IGN,
+							 ipkg, reason);
 				doHook(ipkg, "hook_pkg_ignored",
 				       HookPkgIgnored, 0);
 			} else {
 				++BuildSkipCount;
 				dlog(DLOG_SKIP, "[XXX] %s skipped due to %s\n",
 				     ipkg->portdir, reason);
+				RunStatsUpdateCompletion(NULL, DLOG_SKIP,
+							 ipkg, reason);
 				doHook(ipkg, "hook_pkg_skipped",
 				       HookPkgSkipped, 0);
 			}
@@ -828,12 +851,16 @@ startbuild(pkg_t **build_listp, pkg_t ***build_tailp)
 				++BuildIgnoreCount;
 				dlog(DLOG_IGN, "[XXX] %s ignored due to %s\n",
 				     pkgi->portdir, reason);
+				RunStatsUpdateCompletion(NULL, DLOG_IGN,
+							 pkgi, reason);
 				doHook(pkgi, "hook_pkg_ignored",
 				       HookPkgIgnored, 0);
 			} else {
 				++BuildSkipCount;
 				dlog(DLOG_SKIP, "[XXX] %s skipped due to %s\n",
 				     pkgi->portdir, reason);
+				RunStatsUpdateCompletion(NULL, DLOG_SKIP,
+							 pkgi, reason);
 				doHook(pkgi, "hook_pkg_skipped",
 				       HookPkgSkipped, 0);
 			}
@@ -1022,12 +1049,16 @@ workercomplete(worker_t *work)
 				++BuildIgnoreCount;
 				dlog(DLOG_SKIP, "[%03d] IGNORD %s - %s\n",
 				     work->index, pkg->portdir, reason);
+				RunStatsUpdateCompletion(work, DLOG_SKIP,
+							 pkg, reason);
 				doHook(pkg, "hook_pkg_ignored",
 				       HookPkgIgnored, 0);
 			} else {
 				++BuildSkipCount;
 				dlog(DLOG_SKIP, "[%03d] SKIPPD %s - %s\n",
 				     work->index, pkg->portdir, reason);
+				RunStatsUpdateCompletion(work, DLOG_SKIP,
+							 pkg, reason);
 				doHook(pkg, "hook_pkg_skipped",
 				       HookPkgSkipped, 0);
 			}
@@ -1038,10 +1069,12 @@ workercomplete(worker_t *work)
 
 			scount = buildskipcount_dueto(pkg, 1);
 			buildskipcount_dueto(pkg, 0);
-			if (scount)
-				snprintf(skipbuf, sizeof(skipbuf), " (%d)", scount);
-			else
+			if (scount) {
+				snprintf(skipbuf, sizeof(skipbuf), " %d",
+					 scount);
+			} else {
 				skipbuf[0] = 0;
+			}
 
 			++BuildFailCount;
 			dlog(DLOG_FAIL | DLOG_RED,
@@ -1049,6 +1082,7 @@ workercomplete(worker_t *work)
 			     work->index, pkg->portdir, skipbuf,
 			     getphasestr(work->phase),
 			     h, m, s);
+			RunStatsUpdateCompletion(work, DLOG_FAIL, pkg, skipbuf);
 			doHook(pkg, "hook_pkg_failure", HookPkgFailure, 0);
 		}
 	} else {
@@ -1057,6 +1091,7 @@ workercomplete(worker_t *work)
 		dlog(DLOG_SUCC | DLOG_GRN,
 		     "[%03d] SUCCESS %s ##%02d:%02d:%02d\n",
 		     work->index, pkg->portdir, h, m, s);
+		RunStatsUpdateCompletion(work, DLOG_SUCC, pkg, "");
 		doHook(pkg, "hook_pkg_success", HookPkgSuccess, 0);
 	}
 	++BuildCount;
@@ -1107,7 +1142,7 @@ waitbuild(int whilematch, int dynamicmax)
 			}
 			RunStatsUpdate(work, NULL);
 		}
-		RunStatsUpdateTop();
+		RunStatsUpdateTop(1);
 		RunStatsUpdateLogs();
 		RunStatsSync();
 		if (RunningWorkers == whilematch) {
@@ -1158,6 +1193,7 @@ waitbuild(int whilematch, int dynamicmax)
 			 * Cap based on load.  This is back-loaded.
 			 */
 			getloadavg(dload, 3);
+			adjloadavg(dload);
 			if (dload[0] < min_load) {
 				max1 = MaxWorkers;
 			} else if (dload[0] <= max_load) {
@@ -1275,6 +1311,7 @@ childBuilderThread(void *arg)
 	pkg_t *pkg;
 	pid_t pid;
 	int status;
+	int flags;
 	volatile int dowait;
 	char slotbuf[8];
 	char fdbuf[8];
@@ -1305,12 +1342,20 @@ childBuilderThread(void *arg)
 				       PF_UNSPEC, work->fds)) {
 				dfatal_errno("socketpair() during worker fork");
 			}
-			snprintf(slotbuf, sizeof(slotbuf),
-				 "%d", work->index);
-			snprintf(fdbuf, sizeof(fdbuf),
-				 "3");
-			snprintf(flagsbuf, sizeof(flagsbuf),
-				 "%d", WorkerProcFlags);
+			snprintf(slotbuf, sizeof(slotbuf), "%d", work->index);
+			snprintf(fdbuf, sizeof(fdbuf), "3");
+
+			/*
+			 * Pass global flags and add-in the DEBUGSTOP if
+			 * the package is flagged for debugging.
+			 */
+			flags = WorkerProcFlags;
+			if (work->pkg->flags & PKGF_DEBUGSTOP) {
+				flags |= WORKER_PROC_DEBUGSTOP;
+			} else {
+				flags &= ~WORKER_PROC_DEBUGSTOP;
+			}
+			snprintf(flagsbuf, sizeof(flagsbuf), "%d", flags);
 
 			/*
 			 * fds[0] - master
@@ -1327,6 +1372,7 @@ childBuilderThread(void *arg)
 				closefrom(4);
 				fcntl(3, F_SETFD, 0);
 				execle(DSynthExecPath, DSynthExecPath,
+				       "-p", Profile,
 				       "WORKER", slotbuf, fdbuf,
 				       work->pkg->portdir, work->pkg->pkgfile,
 				       flagsbuf,
@@ -1431,8 +1477,15 @@ childBuilderThread(void *arg)
 			 * does something about it.
 			 */
 			break;
+		case WORKER_FROZEN:
+			/*
+			 * A worker getting frozen is debug-related.  We
+			 * just sit in this state (likely forever).
+			 */
+			break;
 		default:
-			dfatal("worker: [%03d] Unexpected state %d for worker %d",
+			dfatal("worker: [%03d] Unexpected state %d "
+			       "for worker %d",
 			       work->index, work->state, work->index);
 			/* NOT REACHED */
 			break;
@@ -1500,6 +1553,19 @@ childInstallPkgDeps(worker_t *work)
 	return 1;
 }
 
+/*
+ * Recursive child install dependencies.
+ *
+ * first_one_only is only specified if the pkg the list comes from
+ * is a generic unflavored package that has flavors, telling us to
+ * dive the first flavor only.
+ *
+ * However, in nearly all cases this flag will now be zero because
+ * this code now dives the first flavor when encountering a dummy node
+ * and clears nfirst on success.  Hence if you are asking why 'nfirst'
+ * is set to 1, and then zero, instead of just being removed entirely,
+ * it is because there might still be an edge case here.
+ */
 static size_t
 childInstallPkgDeps_recurse(FILE *fp, pkglink_t *list, int undoit,
 			    int depth, int first_one_only)
@@ -1537,6 +1603,34 @@ childInstallPkgDeps_recurse(FILE *fp, pkglink_t *list, int undoit,
 			continue;
 		}
 
+		/*
+		 * If this is a dummy node with no package, the originator
+		 * is requesting a flavored package.  We select the default
+		 * flavor which we presume is the first one.
+		 */
+		if (pkg->pkgfile == NULL && (pkg->flags & PKGF_DUMMY)) {
+			pkg_t *spkg = pkg->idepon_list.next->pkg;
+
+			if (spkg) {
+				if (fp) {
+					fprintf(fp,
+						"echo 'UNFLAVORED %s -> use "
+						"%s'\n",
+						pkg->portdir,
+						spkg->portdir);
+				}
+				pkg = spkg;
+				nfirst = 0;
+			} else {
+				if (fp) {
+					fprintf(fp,
+						"echo 'CANNOT FIND DEFAULT "
+						"FLAVOR FOR %s'\n",
+						pkg->portdir);
+				}
+			}
+		}
+
 		if (undoit) {
 			if (pkg->dsynth_install_flg == 1) {
 				pkg->dsynth_install_flg = 0;
@@ -1549,6 +1643,7 @@ childInstallPkgDeps_recurse(FILE *fp, pkglink_t *list, int undoit,
 				break;
 			continue;
 		}
+
 		if (pkg->dsynth_install_flg) {
 			if (DebugOpt >= 2 && pkg->pkgfile && fp) {
 				fprintf(fp, "echo 'AlreadyHave %s'\n",
@@ -1569,37 +1664,12 @@ childInstallPkgDeps_recurse(FILE *fp, pkglink_t *list, int undoit,
 		pkg->dsynth_install_flg = 1;
 
 		/*
-		 * If this is a dummy node with no package, the originator
-		 * is requesting a flavored package.  We select the default
-		 * flavor which we presume is the first one.
-		 */
-		if (pkg->pkgfile == NULL && (pkg->flags & PKGF_DUMMY)) {
-			pkg_t *spkg = pkg->idepon_list.next->pkg;
-
-			if (spkg) {
-				pkg = spkg;
-				if (fp) {
-					fprintf(fp,
-						"echo 'DUMMY use %s (%p)'\n",
-						pkg->portdir, pkg->pkgfile);
-				}
-			} else {
-				if (fp) {
-					fprintf(fp,
-						"echo 'CANNOT FIND DEFAULT "
-						"FLAVOR FOR %s'\n",
-						pkg->portdir);
-				}
-			}
-		}
-
-		/*
 		 * Generate package installation command
 		 */
 		if (fp && pkg->pkgfile) {
 			fprintf(fp, "echo 'Installing /packages/All/%s'\n",
 				pkg->pkgfile);
-			fprintf(fp, "pkg install -q -y /packages/All/%s "
+			fprintf(fp, "pkg install -q -U -y /packages/All/%s "
 				"|| exit 1\n",
 				pkg->pkgfile);
 		} else if (fp) {
@@ -2322,6 +2392,7 @@ dophase(worker_t *work, wmsg_t *wmsg, int wdog, int phaseid, const char *phase)
 			 * Watchdog scaling
 			 */
 			getloadavg(dload, 3);
+			adjloadavg(dload);
 			dv = dload[2] / NumCores;
 			if (dv < (double)NumCores) {
 				wdog_scaled = wdog;
@@ -2678,7 +2749,7 @@ mptylogpoll(int ptyfd, int fdlog, wmsg_t *wmsg, time_t *wdog_timep)
  */
 #define COPYBLKSIZE	32768
 
-static int
+int
 copyfile(char *src, char *dst)
 {
 	char *tmp;
@@ -2894,4 +2965,32 @@ childHookRun(bulk_t *bulk)
 		     "[XXX] %s SCRIPT %s (%s)\n",
 		     bulk->s1, bulk->s2, bulk->s3);
 	}
+}
+
+/*
+ * Adjusts dload[0] by adding in t_pw (processes waiting on page-fault).
+ * We don't want load reductions due to e.g. thrashing to cause dsynth
+ * to increase the dynamic limit because it thinks the load is low.
+ *
+ * This has a desirable property.  If the system pager cannot keep up
+ * with process demand t_pw will spike while loadavg will only drop
+ * slowly, resulting in a high adjusted load calculation that causes
+ * dsynth to quickly clamp-down the limit.  If the condition alleviates,
+ * the limit will then rise slowly again, possibly even before existing
+ * jobs are retired to meet the clamp-down from the original spike.
+ */
+static void
+adjloadavg(double *dload)
+{
+#if defined(__DragonFly__)
+	struct vmtotal total;
+	size_t size;
+
+	size = sizeof(total);
+	if (sysctlbyname("vm.vmtotal", &total, &size, NULL, 0) == 0) {
+		dload[0] += (double)total.t_pw;
+	}
+#else
+	dload[0] += 0.0;	/* just avoid compiler 'unused' warnings */
+#endif
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 The DragonFly Project.  All rights reserved.
+ * Copyright (c) 2019-2020 The DragonFly Project.  All rights reserved.
  *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
@@ -35,22 +35,27 @@
  * SUCH DAMAGE.
  */
 #include "dsynth.h"
+#include <openssl/md5.h>
 
 typedef struct pinfo {
 	struct pinfo *next;
 	char *spath;
 	int foundit;
+	int inlocks;
 } pinfo_t;
 
 static void removePackagesMetaRecurse(pkg_t *pkg);
 static int pinfocmp(const void *s1, const void *s2);
 static void scanit(const char *path, const char *subpath,
-			int *countp, pinfo_t ***list_tailp);
+			int *countp, pinfo_t ***list_tailp,
+			int inlocks);
 pinfo_t *pinfofind(pinfo_t **ary, int count, char *spath);
 static void childRebuildRepo(bulk_t *bulk);
 static void scandeletenew(const char *path);
 
 static void rebuildTerminateSignal(int signo);
+static char *md5lkfile(char *rpath, int which);
+static int lkdircount(char *buf);
 
 static char *RebuildRemovePath;
 
@@ -111,8 +116,9 @@ DoRebuildRepo(int ask)
 }
 
 static void
-repackage(const char *basepath, const char *basefile, const char *sufx,
-	  const char *comp, const char *decomp);
+repackage(const char *basepath, const char *basefile,
+	  const char *decomp_suffix, const char *comp_suffix,
+	  const char *decomp, const char *comp);
 
 static void
 childRebuildRepo(bulk_t *bulk)
@@ -123,6 +129,7 @@ childRebuildRepo(bulk_t *bulk)
 	pid_t pid;
 	const char *cav[MAXCAC];
 	int cac;
+	int repackage_mode = 0;
 
 	cac = 0;
 	cav[cac++] = PKG_BINARY;
@@ -145,16 +152,38 @@ childRebuildRepo(bulk_t *bulk)
 	fp = dexec_open(cav, cac, &pid, NULL, 1, 0);
 	while ((ptr = fgetln(fp, &len)) != NULL)
 		fwrite(ptr, 1, len, stdout);
-	if (dexec_close(fp, pid) == 0) {
+	if (dexec_close(fp, pid) == 0)
 		bulk->r1 = strdup("");
+
+	/*
+	 * Check package version.  Pkg version 1.12 and later generates
+	 * the proper repo compression format.  Prior to that version
+	 * the repo directive always generated .txz files.
+	 */
+	cac = 0;
+	cav[cac++] = PKG_BINARY;
+	cav[cac++] = "-v";
+	fp = dexec_open(cav, cac, &pid, NULL, 1, 0);
+	if ((ptr = fgetln(fp, &len)) != NULL && len > 0) {
+		int v1;
+		int v2;
+
+		ptr[len-1] = 0;
+		if (sscanf(ptr, "%d.%d", &v1, &v2) == 2) {
+			if (v1 > 1 || (v1 == 1 && v2 >= 12))
+				repackage_mode = 1;
+		}
 	}
+	dexec_close(fp, pid);
 
 	/*
 	 * Repackage the .txz files created by pkg repo if necessary
 	 */
-	if (strcmp(UsePkgSufx, ".txz") != 0) {
+	if (repackage_mode == 0 && strcmp(UsePkgSufx, ".txz") != 0) {
 		const char *comp;
 		const char *decomp;
+
+		printf("pkg repo - recompressing digests and packagesite\n");
 
 		if (strcmp(UsePkgSufx, ".tar") == 0) {
 			decomp = "unxz";
@@ -166,26 +195,55 @@ childRebuildRepo(bulk_t *bulk)
 			decomp = "unxz";
 			comp = "bzip";
 		} else {
-			dfatal("repackaging as %s not supported", UsePkgSufx);
+			dfatal("recompressing as %s not supported",
+			       UsePkgSufx);
 			decomp = "unxz";
 			comp = "cat";
 		}
-		repackage(PackagesPath, "digests", UsePkgSufx,
-			  comp, decomp);
-		repackage(PackagesPath, "packagesite", UsePkgSufx,
-			  comp, decomp);
+		repackage(PackagesPath, "digests",
+			  ".txz", UsePkgSufx,
+			  decomp, comp);
+		repackage(PackagesPath, "packagesite",
+			  ".txz", UsePkgSufx,
+			  decomp, comp);
+	} else if (repackage_mode == 1 && strcmp(UsePkgSufx, ".txz") != 0) {
+		const char *comp;
+		const char *decomp;
+
+		printf("pkg repo - recompressing meta\n");
+
+		if (strcmp(UsePkgSufx, ".tar") == 0) {
+			decomp = "cat";
+			comp = "xz";
+		} else if (strcmp(UsePkgSufx, ".tgz") == 0) {
+			decomp = "gunzip";
+			comp = "xz";
+		} else if (strcmp(UsePkgSufx, ".tbz") == 0) {
+			decomp = "bunzip2";
+			comp = "xz";
+		} else {
+			dfatal("recompressing from %s not supported",
+			       UsePkgSufx);
+			decomp = "cat";
+			comp = "cat";
+		}
+		repackage(PackagesPath, "meta",
+			  UsePkgSufx, ".txz",
+			  decomp, comp);
 	}
 }
 
 static
 void
-repackage(const char *basepath, const char *basefile, const char *sufx,
-	  const char *comp, const char *decomp)
+repackage(const char *basepath, const char *basefile,
+	  const char *decomp_suffix, const char *comp_suffix,
+	  const char *decomp, const char *comp)
 {
 	char *buf;
 
-	asprintf(&buf, "%s < %s/%s.txz | %s > %s/%s%s",
-		decomp, basepath, basefile, comp, basepath, basefile, sufx);
+	asprintf(&buf, "%s < %s/%s%s | %s > %s/%s%s",
+		decomp, basepath, basefile, decomp_suffix,
+		comp, basepath, basefile, comp_suffix);
 	if (system(buf) != 0) {
 		dfatal("command failed: %s", buf);
 	}
@@ -216,7 +274,7 @@ PurgeDistfiles(pkg_t *pkgs)
 	count = 0;
 	list = NULL;
 	list_tail = &list;
-	scanit(DistFilesPath, NULL, &count, &list_tail);
+	scanit(DistFilesPath, NULL, &count, &list_tail, 0);
 	printf("Checking %d distfiles\n", count);
 	fflush(stdout);
 
@@ -235,20 +293,40 @@ PurgeDistfiles(pkg_t *pkgs)
 		dstr = strtok(pkgs->distfiles, " \t");
 		while (dstr) {
 			for (;;) {
+				/*
+				 * Look for distfile
+				 */
 				if (pkgs->distsubdir) {
 					asprintf(&buf, "%s/%s",
 						 pkgs->distsubdir, dstr);
-					item = pinfofind(ary, count, buf);
-					ddprintf(0, "TEST %s %p\n", buf, item);
+				} else {
+					buf = dstr;
+				}
+				item = pinfofind(ary, count, buf);
+				if (item)
+					item->foundit = 1;
+				if (item && item->inlocks == 0) {
+					/*
+					 * Look for the lock file
+					 */
+					int scount;
+
+					scount = lkdircount(buf);
+
+					for (i = 0; i <= scount; ++i) {
+						item = pinfofind(ary, count,
+							     md5lkfile(buf, i));
+						if (item)
+							item->foundit = 1;
+					}
+				}
+
+				/*
+				 * Cleanup and iterate
+				 */
+				if (buf != dstr) {
 					free(buf);
 					buf = NULL;
-				} else {
-					item = pinfofind(ary, count, dstr);
-					ddprintf(0, "TEST %s %p\n", dstr, item);
-				}
-				if (item) {
-					item->foundit = 1;
-					break;
 				}
 				if (strrchr(dstr, ':') == NULL)
 					break;
@@ -265,7 +343,9 @@ PurgeDistfiles(pkg_t *pkgs)
 			++delcount;
 		}
 	}
-	if (askyn("Delete %d of %d items? ", delcount, count)) {
+	if (delcount == 0) {
+		printf("No obsolete source files out of %d found\n", count);
+	} else if (askyn("Delete %d of %d items? ", delcount, count)) {
 		printf("Deleting %d/%d obsolete source distfiles\n",
 		       delcount, count);
 		for (i = 0; i < count; ++i) {
@@ -275,6 +355,8 @@ PurgeDistfiles(pkg_t *pkgs)
 					 DistFilesPath, item->spath);
 				if (remove(buf) < 0)
 					printf("Cannot delete %s\n", buf);
+				else
+					printf("Deleted %s\n", item->spath);
 				free(buf);
 			}
 		}
@@ -371,7 +453,8 @@ pinfofind(pinfo_t **ary, int count, char *spath)
 
 void
 scanit(const char *path, const char *subpath,
-       int *countp, pinfo_t ***list_tailp)
+       int *countp, pinfo_t ***list_tailp,
+       int inlocks)
 {
 	struct dirent *den;
 	pinfo_t *item;
@@ -393,15 +476,20 @@ scanit(const char *path, const char *subpath,
 				continue;
 			}
 			if (S_ISDIR(st.st_mode)) {
+				int sublocks;
+
+				sublocks =
+				    (strcmp(den->d_name, ".locks") == 0);
+
 				if (subpath) {
 					asprintf(&spath, "%s/%s",
 						 subpath, den->d_name);
-					scanit(npath, spath,
-					       countp, list_tailp);
+					scanit(npath, spath, countp,
+					       list_tailp, sublocks);
 					free(spath);
 				} else {
-					scanit(npath, den->d_name,
-					       countp, list_tailp);
+					scanit(npath, den->d_name, countp,
+					       list_tailp, sublocks);
 				}
 			} else if (S_ISREG(st.st_mode)) {
 				item = calloc(1, sizeof(*item));
@@ -411,6 +499,8 @@ scanit(const char *path, const char *subpath,
 				} else {
 					item->spath = strdup(den->d_name);
 				}
+				item->inlocks = inlocks;
+
 				**list_tailp = item;
 				*list_tailp = &item->next;
 				++*countp;
@@ -456,4 +546,65 @@ rebuildTerminateSignal(int signo __unused)
 		remove(RebuildRemovePath);
 	exit(1);
 
+}
+
+/*
+ * There will be a .locks sub-directory in /usr/distfiles and also
+ * in each sub-directory underneath it containing the MD5 sums for
+ * the files in that subdirectory.
+ *
+ * This is a bit of a mess.  Sometimes the .locks/ for a subdirectory
+ * are in parentdir/.locks and not parentdir/subdir/.locks.  The invocation
+ * of do-fetch can be a bit messy so we look for a .locks subdir everywhere.
+ *
+ * The /usr/dports/Mk/Scripts/do-fetch.sh script uses 'echo blah | md5',
+ * so we have to add a newline to the buffer being md5'd.
+ *
+ * The pass-in rpath is relative to the distfiles base.
+ */
+static char *
+md5lkfile(char *rpath, int which_slash)
+{
+	static char mstr[128];
+	static char lkfile[128];
+	uint8_t digest[MD5_DIGEST_LENGTH];
+	int bplen;
+	int i;
+
+	bplen = 0;
+	for (i = 0; i < which_slash; ++i) {
+		while (rpath[bplen] && rpath[bplen] != '/')
+			++bplen;
+		if (rpath[bplen])
+			++bplen;
+	}
+	snprintf(mstr, sizeof(mstr), "%s\n", rpath + bplen);
+	MD5(mstr, strlen(mstr), digest);
+
+	snprintf(lkfile, sizeof(lkfile),
+		"%*.*s.locks/"
+		 "%02x%02x%02x%02x%02x%02x%02x%02x"
+		 "%02x%02x%02x%02x%02x%02x%02x%02x"
+		 ".lk",
+		 bplen, bplen, rpath,
+		 digest[0], digest[1], digest[2], digest[3],
+		 digest[4], digest[5], digest[6], digest[7],
+		 digest[8], digest[9], digest[10], digest[11],
+		 digest[12], digest[13], digest[14], digest[15]);
+
+	return lkfile;
+}
+
+static int
+lkdircount(char *buf)
+{
+	int i;
+	int n;
+
+	n = 0;
+	for (i = 0; buf[i]; ++i) {
+		if (buf[i] == '/')
+			++n;
+	}
+	return n;
 }

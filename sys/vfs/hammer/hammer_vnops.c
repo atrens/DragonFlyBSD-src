@@ -278,14 +278,14 @@ skip:
 		int dorelock;
 
 		if ((ap->a_vp->v_flag & VRECLAIMED) == 0) {
-			vx_unlock(ap->a_vp);
+			vn_unlock(ap->a_vp);
 			dorelock = 1;
 		} else {
 			dorelock = 0;
 		}
 		hammer_wait_inode(ip);
 		if (dorelock)
-			vx_lock(ap->a_vp);
+			vn_relock(ap->a_vp, LK_EXCLUSIVE);
 	}
 	if (ip->vp && (ip->flags & HAMMER_INODE_MODMASK) == 0)
 		vclrisdirty(ip->vp);
@@ -664,7 +664,7 @@ hammer_vop_write(struct vop_write_args *ap)
 			if (uio->uio_offset > ip->ino_data.size)
 				trivial = 0;
 			else
-				trivial = 1;
+				trivial = NVEXTF_TRIVIAL;
 			nvextendbuf(ap->a_vp,
 				    ip->ino_data.size,
 				    nsize,

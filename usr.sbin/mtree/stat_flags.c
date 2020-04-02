@@ -30,9 +30,7 @@
  * SUCH DAMAGE.
  */
 
-#if HAVE_NBTOOL_CONFIG_H
-#include "nbtool_config.h"
-#else
+#ifdef __DragonFly__
 #define HAVE_STRUCT_STAT_ST_FLAGS 1
 #endif
 
@@ -117,8 +115,10 @@ flags_to_string(u_long flags, const char *def)
 int
 string_to_flags(char **stringp, u_long *setp, u_long *clrp)
 {
+#if HAVE_STRUCT_STAT_ST_FLAGS
 	int clear;
 	char *string, *p;
+#endif
 
 	if (setp)
 		*setp = 0;

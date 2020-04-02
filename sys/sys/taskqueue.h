@@ -57,6 +57,7 @@ typedef void (*taskqueue_enqueue_fn)(void *context);
 
 struct task {
 	STAILQ_ENTRY(task) ta_link;	/* link for queue */
+	struct taskqueue *ta_queue;
 	int	ta_pending;		/* count times queued */
 	int	ta_priority;		/* priority of task in queue */
 	task_fn_t *ta_func;		/* task handler */
@@ -64,7 +65,6 @@ struct task {
 };
 
 struct timeout_task {
-	struct taskqueue *q;
 	struct task t;
 	struct callout c;
 	int    f;
@@ -77,13 +77,17 @@ int	taskqueue_start_threads(struct taskqueue **tqp, int count, int pri,
 				int ncpu, const char *name, ...)
 				__printflike(5, 6);
 int	taskqueue_enqueue(struct taskqueue *queue, struct task *task);
+int	taskqueue_enqueue_optq(struct taskqueue *queue,
+	    struct taskqueue **qpp, struct task *task);
 int	taskqueue_enqueue_timeout(struct taskqueue *queue,
 	    struct timeout_task *timeout_task, int ticks);
 int	taskqueue_cancel(struct taskqueue *queue, struct task *task,
 	    u_int *pendp);
+int	taskqueue_cancel_simple(struct task *task);
 int	taskqueue_cancel_timeout(struct taskqueue *queue,
 	    struct timeout_task *timeout_task, u_int *pendp);
 void	taskqueue_drain(struct taskqueue *queue, struct task *task);
+void	taskqueue_drain_simple(struct task *task);
 void	taskqueue_drain_timeout(struct taskqueue *queue,
 	    struct timeout_task *timeout_task);
 struct	taskqueue *taskqueue_find(const char *name);
@@ -92,7 +96,8 @@ void	taskqueue_block(struct taskqueue *queue);
 void	taskqueue_unblock(struct taskqueue *queue);
 
 #define TASK_INITIALIZER(priority, func, context)	\
-	{ .ta_pending = 0,				\
+	{ .ta_queue = NULL,				\
+	  .ta_pending = 0,				\
 	  .ta_priority = (priority),			\
 	  .ta_func = (func),				\
 	  .ta_context = (context) }
@@ -107,6 +112,7 @@ void	taskqueue_thread_enqueue(void *context);
  * Initialise a task structure.
  */
 #define TASK_INIT(task, priority, func, context) do {	\
+	(task)->ta_queue = NULL;			\
 	(task)->ta_pending = 0;				\
 	(task)->ta_priority = (priority);		\
 	(task)->ta_func = (func);			\
@@ -140,15 +146,15 @@ taskqueue_define_##name(void *arg)					\
 	init;								\
 }									\
 									\
-SYSINIT(taskqueue_##name, SI_SUB_CONFIGURE, SI_ORDER_SECOND,		\
+SYSINIT(taskqueue_##name, SI_SUB_PRE_DRIVERS, SI_ORDER_SECOND,		\
 	taskqueue_define_##name, NULL);					\
 									\
 struct __hack
 
 #define	TASKQUEUE_DEFINE_THREAD(name)					\
 TASKQUEUE_DEFINE(name, taskqueue_thread_enqueue, &taskqueue_##name,	\
-	taskqueue_start_threads(&taskqueue_##name, 1, prio,		\
-	"%s taskq", #name))
+	taskqueue_start_threads(&taskqueue_##name, 1,			\
+	TDPRI_KERN_DAEMON, -1, "%s taskq", #name))
 /*
  * This queue is serviced by a software interrupt handler.  To enqueue
  * a task, call taskqueue_enqueue(taskqueue_swi, &task).

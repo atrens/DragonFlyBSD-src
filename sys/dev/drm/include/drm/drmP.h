@@ -545,7 +545,7 @@ struct drm_lock_data {
 	struct drm_file *file_priv;
 	wait_queue_head_t lock_queue;	/**< Queue of blocked processes */
 	unsigned long lock_time;	/**< Time of last lock in jiffies */
-	struct spinlock spinlock;
+	spinlock_t spinlock;
 	uint32_t kernel_waiters;
 	uint32_t user_waiters;
 	int idle_has_lock;
@@ -919,7 +919,7 @@ struct drm_device {
 	/** \name Usage Counters */
 	/*@{ */
 	int open_count;			/**< Outstanding files open, protected by drm_global_mutex. */
-	struct spinlock buf_lock;	/**< For drm_device::buf_use and a few other things. */
+	spinlock_t buf_lock;		/**< For drm_device::buf_use and a few other things. */
 	int buf_use;			/**< Buffers in use -- cannot alloc */
 	atomic_t buf_alloc;		/**< Buffer allocation in progress */
 	/*@} */
@@ -1280,10 +1280,8 @@ extern int drm_platform_init(struct drm_driver *driver, struct platform_device *
 /* returns true if currently okay to sleep */
 static __inline__ bool drm_can_sleep(void)
 {
-#if 0
 	if (in_atomic() || in_dbg_master() || irqs_disabled())
 		return false;
-#endif
 	return true;
 }
 
@@ -1291,6 +1289,10 @@ static __inline__ bool drm_can_sleep(void)
 #define for_each_if(condition) if (!(condition)) {} else
 
 #ifdef __DragonFly__
+struct drm_softc {
+	void *drm_driver_data;
+};
+
 /* sysctl support (drm_sysctl.h) */
 extern int drm_sysctl_init(struct drm_device *dev);
 extern int drm_sysctl_cleanup(struct drm_device *dev);

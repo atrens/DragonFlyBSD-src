@@ -155,7 +155,7 @@ CFLAGS+=	-fno-omit-frame-pointer
 .include <bsd.patch.mk>
 
 .if defined(FIRMWS)
-AWK=/usr/bin/awk
+#AWK=/usr/bin/awk
 .if !exists(@)
 ${KMOD:S/$/.c/}: @
 .else
@@ -356,17 +356,6 @@ ${_src}: @/tools/makeobjops.awk @/${_srcsrc}
 .endfor # _src
 .endfor # _ext
 .endfor # _srcsrc
-
-#.for _ext in c h
-#.if ${SRCS:Mvnode_if.${_ext}} != ""
-#CLEANFILES+=	vnode_if.${_ext}
-#vnode_if.${_ext}: @
-#.if exists(@)
-#vnode_if.${_ext}: @/tools/vnode_if.awk @/kern/vnode_if.src
-#.endif
-#	awk -f @/tools/vnode_if.awk -- -${_ext} @/kern/vnode_if.src
-#.endif
-#.endfor
 
 .if !empty(SRCS:Mmiidevs.h)
 CLEANFILES+=	miidevs.h

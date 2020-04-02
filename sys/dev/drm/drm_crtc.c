@@ -31,12 +31,12 @@
  */
 #include <linux/ctype.h>
 #include <linux/list.h>
+#include <linux/slab.h>
 #include <linux/export.h>
 #include <drm/drmP.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_fourcc.h>
-#include <linux/slab.h>
 #include <drm/drm_modeset_lock.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_auth.h>
@@ -176,7 +176,7 @@ int drm_crtc_init_with_planes(struct drm_device *dev, struct drm_crtc *crtc,
 	crtc->funcs = funcs;
 
 	INIT_LIST_HEAD(&crtc->commit_list);
-	spin_init(&crtc->commit_lock, "dccl");
+	lockinit(&crtc->commit_lock, "dccl", 0, 0);
 
 	drm_modeset_lock_init(&crtc->mutex);
 	ret = drm_mode_object_get(dev, &crtc->base, DRM_MODE_OBJECT_CRTC);

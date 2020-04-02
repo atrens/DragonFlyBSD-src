@@ -36,7 +36,6 @@
 
 /*
  * $FreeBSD: src/sys/kern/kern_jail.c,v 1.6.2.3 2001/08/17 01:00:26 rwatson Exp $
- * $DragonFly: src/sys/kern/kern_jail.c,v 1.19 2008/05/17 18:20:33 dillon Exp $
  */
 
 #include "opt_inet6.h"
@@ -63,6 +62,8 @@
 static struct prison	*prison_find(int);
 static void		prison_ipcache_init(struct prison *);
 
+__read_mostly static prison_cap_t	prison_default_caps;
+
 MALLOC_DEFINE(M_PRISON, "prison", "Prison structures");
 
 SYSCTL_NODE(, OID_AUTO, jail, CTLFLAG_RW, 0,
@@ -71,30 +72,44 @@ SYSCTL_NODE(, OID_AUTO, jail, CTLFLAG_RW, 0,
 SYSCTL_NODE(_jail, OID_AUTO, defaults, CTLFLAG_RW, 0,
     "Default options for jails");
 
-int	jail_set_hostname_allowed = 1;
-SYSCTL_INT(_jail_defaults, OID_AUTO, set_hostname_allowed, CTLFLAG_RW,
-    &jail_set_hostname_allowed, 0,
+/*#define PRISON_DEBUG*/
+#ifdef PRISON_DEBUG
+__read_mostly static int prison_debug;
+SYSCTL_INT(_jail, OID_AUTO, debug, CTLFLAG_RW, &prison_debug, 0,
+    "Debug prison refs");
+#endif
+
+SYSCTL_BIT64(_jail_defaults, OID_AUTO, set_hostname_allowed, CTLFLAG_RW,
+    &prison_default_caps, 1, PRISON_CAP_SYS_SET_HOSTNAME,
     "Processes in jail can set their hostnames");
 
-int	jail_socket_unixiproute_only = 1;
-SYSCTL_INT(_jail_defaults, OID_AUTO, socket_unixiproute_only, CTLFLAG_RW,
-    &jail_socket_unixiproute_only, 0,
+SYSCTL_BIT64(_jail_defaults, OID_AUTO, socket_unixiproute_only, CTLFLAG_RW,
+    &prison_default_caps, 0, PRISON_CAP_NET_UNIXIPROUTE,
     "Processes in jail are limited to creating UNIX/IPv[46]/route sockets only");
 
-int	jail_sysvipc_allowed = 0;
-SYSCTL_INT(_jail_defaults, OID_AUTO, sysvipc_allowed, CTLFLAG_RW,
-    &jail_sysvipc_allowed, 0,
+SYSCTL_BIT64(_jail_defaults, OID_AUTO, sysvipc_allowed, CTLFLAG_RW,
+    &prison_default_caps, 0, PRISON_CAP_SYS_SYSVIPC,
     "Processes in jail can use System V IPC primitives");
 
-int    jail_chflags_allowed = 0;
-SYSCTL_INT(_jail_defaults, OID_AUTO, chflags_allowed, CTLFLAG_RW,
-    &jail_chflags_allowed, 0,
+SYSCTL_BIT64(_jail_defaults, OID_AUTO, chflags_allowed, CTLFLAG_RW,
+    &prison_default_caps, 0, PRISON_CAP_VFS_CHFLAGS,
     "Processes in jail can alter system file flags");
 
-int    jail_allow_raw_sockets = 0;
-SYSCTL_INT(_jail_defaults, OID_AUTO, allow_raw_sockets, CTLFLAG_RW,
-    &jail_allow_raw_sockets, 0,
+SYSCTL_BIT64(_jail_defaults, OID_AUTO, allow_raw_sockets, CTLFLAG_RW,
+    &prison_default_caps, 0, PRISON_CAP_NET_RAW_SOCKETS,
     "Process in jail can create raw sockets");
+
+SYSCTL_BIT64(_jail_defaults, OID_AUTO, allow_listen_override, CTLFLAG_RW,
+    &prison_default_caps, 0, PRISON_CAP_NET_LISTEN_OVERRIDE,
+    "Process in jail can override host wildcard listen");
+
+SYSCTL_BIT64(_jail_defaults, OID_AUTO, vfs_mount_nullfs, CTLFLAG_RW,
+    &prison_default_caps, 0, PRISON_CAP_VFS_MOUNT_NULLFS,
+    "Process in jail can mount nullfs(5) filesystems");
+
+SYSCTL_BIT64(_jail_defaults, OID_AUTO, vfs_mount_tmpfs, CTLFLAG_RW,
+    &prison_default_caps, 0, PRISON_CAP_VFS_MOUNT_TMPFS,
+    "Process in jail can mount tmpfs(5) filesystems");
 
 int	lastprid = 0;
 int	prisoncount = 0;
@@ -300,12 +315,8 @@ sys_jail(struct jail_args *uap)
 	if (error)
 		goto out;
 
-	/* Global settings are the default for all jails */
-	pr->pr_set_hostname_allowed = jail_set_hostname_allowed;
-	pr->pr_socket_unixiproute_only = jail_socket_unixiproute_only;
-	pr->pr_sysvipc_allowed = jail_sysvipc_allowed;
-	pr->pr_chflags_allowed = jail_chflags_allowed;
-	pr->pr_allow_raw_sockets = jail_allow_raw_sockets;
+	/* Use default capabilities as a template */
+	pr->pr_caps = prison_default_caps;
 
 	error = kern_jail(pr, &j);
 	if (error)
@@ -430,6 +441,9 @@ prison_replace_wildcards(struct thread *td, struct sockaddr *ip)
 	return(0);
 }
 
+/*
+ * Convert the localhost IP to the actual jail IP
+ */
 int
 prison_remote_ip(struct thread *td, struct sockaddr *ip)
 {
@@ -450,6 +464,42 @@ prison_remote_ip(struct thread *td, struct sockaddr *ip)
 			return(0);
 		else
 			return(1);
+	}
+	return(1);
+}
+
+/*
+ * Convert the jail IP back to localhost
+ *
+ * Used by getsockname() and getpeername() to convert the in-jail loopback
+ * address back to LOCALHOST.  For example, 127.0.0.2 -> 127.0.0.1.  The
+ * idea is that programs running inside the jail should be unaware that they
+ * are using a different loopback IP than the host.
+ */
+__read_mostly static struct in6_addr sin6_localhost = IN6ADDR_LOOPBACK_INIT;
+
+int
+prison_local_ip(struct thread *td, struct sockaddr *ip)
+{
+	struct sockaddr_in *ip4 = (struct sockaddr_in *)ip;
+	struct sockaddr_in6 *ip6 = (struct sockaddr_in6 *)ip;
+	struct prison *pr;
+
+	if (td == NULL || td->td_proc == NULL || td->td_ucred == NULL)
+		return(1);
+	if ((pr = td->td_ucred->cr_prison) == NULL)
+		return(1);
+	if (ip->sa_family == AF_INET && pr->local_ip4 &&
+	    pr->local_ip4->sin_addr.s_addr == ip4->sin_addr.s_addr &&
+	    pr->local_ip4->sin_addr.s_addr != htonl(INADDR_LOOPBACK)) {
+		ip4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		return(0);
+	}
+	if (ip->sa_family == AF_INET6 && pr->local_ip6 &&
+	    bcmp(&pr->local_ip6->sin6_addr, &ip6->sin6_addr,
+		 sizeof(ip6->sin6_addr)) == 0) {
+		bcopy(&sin6_localhost, &ip6->sin6_addr, sizeof(ip6->sin6_addr));
+		return(0);
 	}
 	return(1);
 }
@@ -569,7 +619,7 @@ prison_if(struct ucred *cred, struct sockaddr *sa)
 	pr = cred->cr_prison;
 
 	if (((sai->sin_family != AF_INET) && (sai->sin_family != AF_INET6))
-	    && jail_socket_unixiproute_only)
+	    && PRISON_CAP_ISSET(pr->pr_caps, PRISON_CAP_NET_UNIXIPROUTE))
 		return(1);
 	else if ((sai->sin_family != AF_INET) && (sai->sin_family != AF_INET6))
 		return(0);
@@ -718,6 +768,12 @@ void
 prison_hold(struct prison *pr)
 {
 	atomic_add_int(&pr->pr_ref, 1);
+#ifdef PRISON_DEBUG
+	if (prison_debug > 0) {
+		--prison_debug;
+		print_backtrace(-1);
+	}
+#endif
 }
 
 /*
@@ -728,12 +784,18 @@ prison_free(struct prison *pr)
 {
 	struct jail_ip_storage *jls;
 
+#ifdef PRISON_DEBUG
+	if (prison_debug > 0) {
+		--prison_debug;
+		print_backtrace(-1);
+	}
+#endif
 	KKASSERT(pr->pr_ref > 0);
 	if (atomic_fetchadd_int(&pr->pr_ref, -1) != 1)
 		return;
 
 	/*
-	 * The MP lock is needed on the last ref to adjust
+	 * The global jail lock is needed on the last ref to adjust
 	 * the list.
 	 */
 	lockmgr(&jail_lock, LK_EXCLUSIVE);
@@ -799,6 +861,21 @@ prison_priv_check(struct ucred *cred, int priv)
 	case PRIV_VFS_MKNOD_BAD:
 	case PRIV_VFS_MKNOD_WHT:
 	case PRIV_VFS_MKNOD_DIR:
+		return (0);
+
+	case PRIV_VFS_MOUNT_NULLFS:
+		if (PRISON_CAP_ISSET(pr->pr_caps, PRISON_CAP_VFS_MOUNT_NULLFS))
+			return (0);
+		else
+			return (EPERM);
+	case PRIV_VFS_MOUNT_DEVFS:
+		return (EPERM);
+	case PRIV_VFS_MOUNT_TMPFS:
+		if (PRISON_CAP_ISSET(pr->pr_caps, PRISON_CAP_VFS_MOUNT_TMPFS))
+			return (0);
+		else
+			return (EPERM);
+
 	case PRIV_VFS_SETATTR:
 	case PRIV_VFS_SETGID:
 
@@ -838,7 +915,8 @@ prison_priv_check(struct ucred *cred, int priv)
 		 * Conditionally allow creating raw sockets in jail.
 		 */
 	case PRIV_NETINET_RAW:
-		if (pr->pr_allow_raw_sockets)
+		if (PRISON_CAP_ISSET(pr->pr_caps,
+			PRISON_CAP_NET_RAW_SOCKETS))
 			return (0);
 		else
 			return (EPERM);
@@ -852,106 +930,6 @@ prison_priv_check(struct ucred *cred, int priv)
 	}
 }
 
-static int
-sysctl_prison_switch_int8(SYSCTL_HANDLER_ARGS, int8_t *val)
-{
-	int new_val;
-	int error;
-
-	new_val = *val;
-
-	error = sysctl_handle_int(oidp, &new_val, 0, req);
-	if (error != 0 || req->newptr == NULL)
-		return error;
-
-	if (new_val != 0 && new_val != 1)
-		return EINVAL;
-
-	*val = new_val;
-
-	return error;
-
-}
-
-static int
-sysctl_prison_set_hostname_allowed(SYSCTL_HANDLER_ARGS)
-{
-	struct prison *pr;
-	int error;
-
-	if (arg1 == NULL)
-		return EINVAL;
-	pr = arg1;
-
-	error = sysctl_prison_switch_int8(oidp, arg1, arg2, req,
-	    &pr->pr_set_hostname_allowed);
-
-	return error;
-}
-
-static int
-sysctl_prison_socket_unixiproute_only(SYSCTL_HANDLER_ARGS)
-{
-	struct prison *pr;
-	int error;
-
-	if (arg1 == NULL)
-		return EINVAL;
-	pr = arg1;
-
-	error = sysctl_prison_switch_int8(oidp, arg1, arg2, req,
-	    &pr->pr_socket_unixiproute_only);
-
-	return error;
-}
-
-static int
-sysctl_prison_sysvipc_allowed(SYSCTL_HANDLER_ARGS)
-{
-	struct prison *pr;
-	int error;
-
-	if (arg1 == NULL)
-		return EINVAL;
-	pr = arg1;
-
-	error = sysctl_prison_switch_int8(oidp, arg1, arg2, req,
-	    &pr->pr_sysvipc_allowed);
-
-	return error;
-}
-
-static int
-sysctl_prison_chflags_allowed(SYSCTL_HANDLER_ARGS)
-{
-	struct prison *pr;
-	int error;
-
-	if (arg1 == NULL)
-		return EINVAL;
-	pr = arg1;
-
-	error = sysctl_prison_switch_int8(oidp, arg1, arg2, req,
-	    &pr->pr_chflags_allowed);
-
-	return error;
-}
-
-static int
-sysctl_prison_allow_raw_sockets(SYSCTL_HANDLER_ARGS)
-{
-	struct prison *pr;
-	int error;
-
-	if (arg1 == NULL)
-		return EINVAL;
-	pr = arg1;
-
-	error = sysctl_prison_switch_int8(oidp, arg1, arg2, req,
-	    &pr->pr_allow_raw_sockets);
-
-	return error;
-}
 
 /*
  * Create a per-jail sysctl tree to control the prison
@@ -964,7 +942,7 @@ prison_sysctl_create(struct prison *pr)
 	ksnprintf(id_str, 6, "%d", pr->pr_id);
 
 	pr->pr_sysctl_ctx = (struct sysctl_ctx_list *) kmalloc(
-		sizeof(struct sysctl_ctx_list), M_TEMP, M_WAITOK | M_ZERO);
+		sizeof(struct sysctl_ctx_list), M_PRISON, M_WAITOK | M_ZERO);
 
 	sysctl_ctx_init(pr->pr_sysctl_ctx);
 
@@ -974,36 +952,45 @@ prison_sysctl_create(struct prison *pr)
 	    OID_AUTO, id_str, CTLFLAG_RD, 0,
 	    "Jail specific settings");
 
-	SYSCTL_ADD_PROC(pr->pr_sysctl_ctx,
-	    SYSCTL_CHILDREN(pr->pr_sysctl_tree), OID_AUTO,
-	    "set_hostname_allowed", CTLTYPE_INT | CTLFLAG_RW,
-	    pr, sizeof(pr->pr_set_hostname_allowed),
-	    sysctl_prison_set_hostname_allowed, "I",
+	SYSCTL_ADD_BIT64(pr->pr_sysctl_ctx, SYSCTL_CHILDREN(pr->pr_sysctl_tree),
+	    OID_AUTO, "sys_set_hostname", CTLFLAG_RW,
+	    &pr->pr_caps, 0, PRISON_CAP_SYS_SET_HOSTNAME,
 	    "Processes in jail can set their hostnames");
-	SYSCTL_ADD_PROC(pr->pr_sysctl_ctx,
-	    SYSCTL_CHILDREN(pr->pr_sysctl_tree), OID_AUTO,
-	    "socket_unixiproute_only", CTLTYPE_INT | CTLFLAG_RW,
-	    pr, sizeof(pr->pr_socket_unixiproute_only),
-	    sysctl_prison_socket_unixiproute_only, "I",
-	    "Processes in jail are limited to creating UNIX/IPv[46]/route sockets only");
-	SYSCTL_ADD_PROC(pr->pr_sysctl_ctx,
-	    SYSCTL_CHILDREN(pr->pr_sysctl_tree), OID_AUTO,
-	    "sysvipc_allowed", CTLTYPE_INT | CTLFLAG_RW,
-	    pr, sizeof(pr->pr_sysvipc_allowed),
-	    sysctl_prison_sysvipc_allowed, "I",
+
+	SYSCTL_ADD_BIT64(pr->pr_sysctl_ctx, SYSCTL_CHILDREN(pr->pr_sysctl_tree),
+	    OID_AUTO, "sys_sysvipc", CTLFLAG_RW,
+	    &pr->pr_caps, 0, PRISON_CAP_SYS_SYSVIPC,
 	    "Processes in jail can use System V IPC primitives");
-	SYSCTL_ADD_PROC(pr->pr_sysctl_ctx,
-	    SYSCTL_CHILDREN(pr->pr_sysctl_tree), OID_AUTO,
-	    "chflags_allowed", CTLTYPE_INT | CTLFLAG_RW,
-	    pr, sizeof(pr->pr_chflags_allowed),
-	    sysctl_prison_chflags_allowed, "I",
-	    "Processes in jail can alter system file flags");
-	SYSCTL_ADD_PROC(pr->pr_sysctl_ctx,
-	    SYSCTL_CHILDREN(pr->pr_sysctl_tree), OID_AUTO,
-	    "allow_raw_sockets", CTLTYPE_INT | CTLFLAG_RW,
-	    pr, sizeof(pr->pr_allow_raw_sockets),
-	    sysctl_prison_allow_raw_sockets, "I",
+
+	SYSCTL_ADD_BIT64(pr->pr_sysctl_ctx, SYSCTL_CHILDREN(pr->pr_sysctl_tree),
+	    OID_AUTO, "net_unixiproute", CTLFLAG_RW,
+	    &pr->pr_caps, 0, PRISON_CAP_NET_UNIXIPROUTE,
+	    "Processes in jail are limited to creating UNIX/IPv[46]/route sockets only");
+
+	SYSCTL_ADD_BIT64(pr->pr_sysctl_ctx, SYSCTL_CHILDREN(pr->pr_sysctl_tree),
+	    OID_AUTO, "net_raw_sockets", CTLFLAG_RW,
+	    &pr->pr_caps, 0, PRISON_CAP_NET_RAW_SOCKETS,
 	    "Process in jail can create raw sockets");
+
+	SYSCTL_ADD_BIT64(pr->pr_sysctl_ctx, SYSCTL_CHILDREN(pr->pr_sysctl_tree),
+	    OID_AUTO, "allow_listen_override", CTLFLAG_RW,
+	    &pr->pr_caps, 0, PRISON_CAP_NET_LISTEN_OVERRIDE,
+	    "Process in jail can create raw sockets");
+
+	SYSCTL_ADD_BIT64(pr->pr_sysctl_ctx, SYSCTL_CHILDREN(pr->pr_sysctl_tree),
+	    OID_AUTO, "vfs_chflags", CTLFLAG_RW,
+	    &pr->pr_caps, 0, PRISON_CAP_VFS_CHFLAGS,
+	    "Process in jail can override host wildcard listen");
+
+	SYSCTL_ADD_BIT64(pr->pr_sysctl_ctx, SYSCTL_CHILDREN(pr->pr_sysctl_tree),
+	    OID_AUTO, "vfs_mount_nullfs", CTLFLAG_RW,
+	    &pr->pr_caps, 0, PRISON_CAP_VFS_MOUNT_NULLFS,
+	    "Processes in jail can mount nullfs(5) filesystems");
+
+	SYSCTL_ADD_BIT64(pr->pr_sysctl_ctx, SYSCTL_CHILDREN(pr->pr_sysctl_tree),
+	    OID_AUTO, "vfs_mount_tmpfs", CTLFLAG_RW,
+	    &pr->pr_caps, 0, PRISON_CAP_VFS_MOUNT_TMPFS,
+	    "Processes in jail can mount tmpfs(5) filesystems");
 
 	return 0;
 }
@@ -1013,7 +1000,7 @@ prison_sysctl_done(struct prison *pr)
 {
 	if (pr->pr_sysctl_tree) {
 		sysctl_ctx_free(pr->pr_sysctl_ctx);
-		kfree(pr->pr_sysctl_ctx, M_TEMP);
+		kfree(pr->pr_sysctl_ctx, M_PRISON);
 		pr->pr_sysctl_tree = NULL;
 	}
 

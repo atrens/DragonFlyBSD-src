@@ -50,43 +50,35 @@
 #include <sys/_timespec.h>
 #endif
 
-#ifdef _KERNEL
-#define	__dev_t	udev_t
-#else
-#define	__dev_t	dev_t
-#endif
-
 /*
  * stat structure notes:
  *
  * NOTE: st_fsmid removed in DragonFly 2.5.x.
  */
 struct stat {
-	ino_t	  st_ino;		/* inode's number */
-	nlink_t	  st_nlink;		/* number of hard links */
-	__dev_t	  st_dev;		/* inode's device */
-	mode_t	  st_mode;		/* inode protection mode */
-	uint16_t  st_padding1;
-	uid_t	  st_uid;		/* user ID of the file's owner */
-	gid_t	  st_gid;		/* group ID of the file's group */
-	__dev_t	  st_rdev;		/* device type */
-	struct	timespec st_atim;	/* time of last access */
-	struct	timespec st_mtim;	/* time of last data modification */
-	struct	timespec st_ctim;	/* time of last file status change */
-	off_t	  st_size;		/* file size, in bytes */
-	blkcnt_t  st_blocks;		/* blocks allocated for file */
-	u_int32_t __old_st_blksize;	/* old ABI compatibility only */
-	u_int32_t st_flags;		/* user defined flags for file */
-	u_int32_t st_gen;		/* file generation number */
-	int32_t	  st_lspare;
-	blksize_t st_blksize;		/* optimal blocksize for I/O */
-	int64_t	  st_qspare2;
+	ino_t		st_ino;		/* inode's number */
+	nlink_t		st_nlink;	/* number of hard links */
+	dev_t		st_dev;		/* inode's device */
+	mode_t		st_mode;	/* inode protection mode */
+	uint16_t	st_padding1;
+	uid_t		st_uid;		/* user ID of the file's owner */
+	gid_t		st_gid;		/* group ID of the file's group */
+	dev_t		st_rdev;		/* device type */
+	struct timespec	st_atim;	/* time of last access */
+	struct timespec	st_mtim;	/* time of last data modification */
+	struct timespec	st_ctim;	/* time of last file status change */
+	off_t		st_size;	/* file size, in bytes */
+	blkcnt_t	st_blocks;	/* blocks allocated for file */
+	u_int32_t	__old_st_blksize; /* old ABI compatibility only */
+	u_int32_t	st_flags;	/* user defined flags for file */
+	u_int32_t	st_gen;		/* file generation number */
+	int32_t		st_lspare;
+	blksize_t	st_blksize;	/* optimal blocksize for I/O */
+	int64_t		st_qspare2;
 };
 
 /*#define _ST_FSMID_PRESENT_*/
 #define	_ST_FLAGS_PRESENT_
-
-#undef __dev_t
 
 #define	st_atime st_atim.tv_sec
 #define	st_mtime st_mtim.tv_sec
@@ -187,11 +179,14 @@ struct stat {
 
 /*
  * The value of `buf' is a pointer to a `stat' data structure. Since we don't
- * implement message queues as distinct file types, the following macro
- * evaluates to zero.
- * XXX: What about semaphores and shared memory objects ?
+ * implement message queues, semaphores, and shared memory objects as distinct
+ * file types, the following macros evaluate to zero.
+ *
+ * XXX: Add S_TYPEISTMO() once we grow support for POSIX typed memory objects.
  */
 #define	S_TYPEISMQ(buf)		(0)	/* message queue */
+#define	S_TYPEISSEM(buf)	(0)	/* semaphore */
+#define	S_TYPEISSHM(buf)	(0)	/* shared memory object */
 
 #if __BSD_VISIBLE
 #define	ACCESSPERMS	(S_IRWXU|S_IRWXG|S_IRWXO)	/* 0777 */

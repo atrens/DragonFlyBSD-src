@@ -49,6 +49,7 @@ int UseTmpfsBase = 1;
 int UseNCurses = -1;		/* indicates default operation (enabled) */
 int LeveragePrebuilt = 0;
 int WorkerProcFlags = 0;
+int DeleteObsoletePkgs;
 long PhysMem;
 const char *OperatingSystemName = "Unknown";	/* e.g. "DragonFly" */
 const char *ArchitectureName = "unknown";	/* e.g. "x86_64" */
@@ -128,7 +129,7 @@ ParseConfiguration(int isworker)
 	if (sysctlbyname("hw.physmem", &PhysMem, &len, NULL, 0) < 0)
 		dfatal_errno("Cannot get hw.physmem");
 	if (PkgDepMemoryTarget == 0)
-		PkgDepMemoryTarget = PhysMem / 2;
+		PkgDepMemoryTarget = PhysMem / 3;
 
 	/*
 	 * Calculate nominal defaults.
@@ -329,6 +330,12 @@ parseConfigFile(const char *path)
 	if (DebugOpt >= 2)
 		ddprintf(0, "ParseConfig %s\n", path);
 
+	if (ProfileOverrideOpt) {
+		Profile = strdup(ProfileOverrideOpt);
+		asprintf(&l2, "[%s]", Profile);
+		ProfileLabel = l2;
+	}
+
 	while (fgets(buf, sizeof(buf), fp) != NULL) {
 		++lineno;
 		len = strlen(buf);
@@ -381,9 +388,11 @@ parseConfigFile(const char *path)
 			 * Global Configuration
 			 */
 			if (strcmp(l1, "profile_selected") == 0) {
-				Profile = strdup(l2);
-				asprintf(&l2, "[%s]", l2);
-				ProfileLabel = l2;
+				if (ProfileOverrideOpt == NULL) {
+					Profile = strdup(l2);
+					asprintf(&l2, "[%s]", l2);
+					ProfileLabel = l2;
+				}
 			} else {
 				dfatal("Unknown directive in config "
 				       "line %d: %s\n", lineno, buf);
@@ -671,9 +680,17 @@ getElfInfo(const char *path)
 		       note.osname1, OperatingSystemName);
 	}
 	free(cmd);
-	asprintf(&cmd, "%d.%d",
-		note.version / 100000,
-		(note.version % 100000) / 100);
+	if (note.version) {
+		asprintf(&cmd, "%d.%d",
+			note.version / 100000,
+			(note.version % 100000) / 100);
+	} else if (note.zero) {
+		asprintf(&cmd, "%d.%d",
+			note.zero / 100000,
+			(note.zero % 100000) / 100);
+	} else {
+		dfatal("%s ELF, cannot extract version info", path);
+	}
 	ReleaseName = cmd;
 }
 

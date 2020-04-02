@@ -470,11 +470,11 @@ MALLOC_DECLARE(M_PARGS);
  * STOPEVENT
  */
 extern void stopevent(struct proc*, unsigned int, unsigned int);
-#define	STOPEVENT(p,e,v)			\
-	do {					\
-		if ((p)->p_stops & (e)) {	\
-			stopevent(p,e,v);	\
-		}				\
+#define	STOPEVENT(p,e,v)					\
+	do {							\
+		if (__predict_false((p)->p_stops & (e))) {	\
+			stopevent(p,e,v);			\
+		}						\
 	} while (0)
 
 /*
@@ -487,6 +487,9 @@ extern void stopevent(struct proc*, unsigned int, unsigned int);
 #define PRELE(p)	prele((p))
 #define PHOLDZOMB(p)	pholdzomb((p))
 #define PRELEZOMB(p)	prelezomb((p))
+#define PWAITRES_PENDING(p)	pwaitres_pending((p))
+#define PWAITRES_SET(p)		pwaitres_set((p))
+
 #define PSTALL(p, msg, n) \
 	do { if ((p)->p_lock > (n)) pstall((p), (msg), (n)); } while (0)
 
@@ -564,6 +567,7 @@ void	sleep_gdinit (struct globaldata *);
 thread_t cpu_heavy_switch (struct thread *);
 thread_t cpu_lwkt_switch (struct thread *);
 
+int	cpu_interrupt_running(struct thread *);
 void	cpu_lwp_exit (void) __dead2;
 void	cpu_thread_exit (void) __dead2;
 void	lwp_exit (int masterexit, void *waddr) __dead2;
@@ -583,6 +587,8 @@ void	faultin (struct proc *p);
 void	swapin_request (void);
 void	phold (struct proc *);
 void	prele (struct proc *);
+int	pwaitres_pending (struct proc *);
+void	pwaitres_set (struct proc *);
 int	pholdzomb (struct proc *);
 void	prelezomb (struct proc *);
 void	pstall (struct proc *, const char *, int);

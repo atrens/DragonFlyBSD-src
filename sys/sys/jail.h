@@ -65,6 +65,30 @@ MALLOC_DECLARE(M_PRISON);
 
 #endif	/* _KERNEL */
 
+/* Jail capabilities */
+#define PRISON_CAP_ROOT			0    /* Catch-all during development */
+
+/* System configuration capabilities */
+#define PRISON_CAP_SYS_SET_HOSTNAME	1    /* Can set hostname */
+#define PRISON_CAP_SYS_SYSVIPC		2    /* Can do SysV IPC calls */
+
+/* Net specific capabiliites */
+#define PRISON_CAP_NET_UNIXIPROUTE	20   /* Restrict to UNIX/IPv[46]/route
+                                                sockets only */
+#define PRISON_CAP_NET_RAW_SOCKETS	21   /* Can use raw sockets */
+#define PRISON_CAP_NET_LISTEN_OVERRIDE	22   /* Can override wildcard on host */
+
+/* VFS specific capabilities */
+#define PRISON_CAP_VFS_CHFLAGS		40   /* Can manipulate system file
+                                                flags */
+#define PRISON_CAP_VFS_MOUNT_NULLFS	45   /* Can mount nullfs(5) */
+#define PRISON_CAP_VFS_MOUNT_DEVFS	46   /* Can mount devfs(5) */
+#define PRISON_CAP_VFS_MOUNT_TMPFS	47   /* Can mount tmpfs(5) */
+
+typedef __uint64_t prison_cap_t;
+
+#define PRISON_CAP_ISSET(mask, bit)	(mask & (1LU << bit))
+
 #if defined(_KERNEL) || defined(_KERNEL_STRUCTURES)
 
 #define	JAIL_MAX	999999
@@ -102,21 +126,8 @@ struct prison {
 	struct sysctl_ctx_list *pr_sysctl_ctx;
 	struct sysctl_oid *pr_sysctl_tree;
 
-	int8_t		pr_set_hostname_allowed;
-	int8_t		pr_socket_unixiproute_only;
-	int8_t		pr_sysvipc_allowed;
-	int8_t		pr_chflags_allowed;
-	int8_t		pr_allow_raw_sockets;
+	prison_cap_t	pr_caps;			/* Prison capabilities */
 };
-
-/*
- * Sysctl-set variables that determine global jail policy
- */
-extern int	jail_set_hostname_allowed;
-extern int	jail_socket_unixiproute_only;
-extern int	jail_sysvipc_allowed;
-extern int	jail_chflags_allowed;
-extern int	jail_allow_raw_sockets;
 
 /*
  * Kernel support functions for jail.
@@ -131,6 +142,7 @@ struct sockaddr *
 	prison_get_nonlocal(struct prison *pr, sa_family_t, struct sockaddr *);
 int	prison_priv_check(struct ucred *cred, int priv);
 int	prison_remote_ip(struct thread *td, struct sockaddr *ip);
+int	prison_local_ip(struct thread *td, struct sockaddr *ip);
 int	prison_replace_wildcards(struct thread *td, struct sockaddr *ip);
 int	prison_sysctl_create(struct prison *);
 int	prison_sysctl_done(struct prison *);

@@ -30,17 +30,10 @@
  * SUCH DAMAGE.
  */
 
-#if HAVE_NBTOOL_CONFIG_H
-#include "nbtool_config.h"
-#endif
-
 #include <sys/param.h>
 #include <sys/stat.h>
 
-#if ! HAVE_NBTOOL_CONFIG_H
 #include <dirent.h>
-#endif
-
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -269,7 +262,7 @@ statf(FILE *fp, int indent, FTSENT *p)
 		output(fp, indent, &offset, "size=%ju",
 		    (uintmax_t)p->fts_statp->st_size);
 	if (keys & F_TIME)
-#if defined(BSD4_4) && !defined(HAVE_NBTOOL_CONFIG_H)
+#if defined(BSD4_4)
 		output(fp, indent, &offset, "time=%jd.%09ld",
 		    (intmax_t)p->fts_statp->st_mtimespec.tv_sec,
 		    p->fts_statp->st_mtimespec.tv_nsec);
@@ -330,7 +323,9 @@ statd(FILE *fp, FTS *t, FTSENT *parent, uid_t *puid, gid_t *pgid, mode_t *pmode,
 	gid_t sgid;
 	uid_t suid;
 	mode_t smode;
+#if HAVE_STRUCT_STAT_ST_FLAGS
 	u_long sflags = 0;
+#endif
 	const char *name = NULL;
 	gid_t savegid;
 	uid_t saveuid;

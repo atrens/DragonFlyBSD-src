@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017-2019 François Tigeot <ftigeot@wolfpond.org>
+ * Copyright (c) 2017-2020 François Tigeot <ftigeot@wolfpond.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -40,6 +40,8 @@
 #include <linux/ktime.h>
 
 #include <asm/barrier.h>
+
+#include <linux/rcutree.h>
 
 static inline void
 call_rcu(struct rcu_head *head, void (*func)(struct rcu_head *))
@@ -83,5 +85,9 @@ do {					\
 do {					\
 	kfree(ptr);			\
 } while (0)
+
+#define rcu_access_pointer(p)	((typeof(*p) *)READ_ONCE(p))
+
+#define rcu_pointer_handoff(p)	(p)
 
 #endif  /* _LINUX_RCUPDATE_H_ */

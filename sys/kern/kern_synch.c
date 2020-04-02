@@ -243,6 +243,10 @@ schedcpu_stats(struct proc *p, void *data __unused)
 		 * Only recalculate processes that are active or have slept
 		 * less then 2 seconds.  The schedulers understand this.
 		 * Otherwise decay by 50% per second.
+		 *
+		 * NOTE: uload_update is called separately from kern_synch.c
+		 *	 when slptime == 1, removing the thread's
+		 *	 uload/ucount.
 		 */
 		if (lp->lwp_slptime <= 1) {
 			p->p_usched->recalculate(lp);
@@ -355,8 +359,8 @@ updatepcpu(struct lwp *lp, int cpticks, int ttlticks)
 			  LOOKUP_PRIME) % slpque_tablesize)
 #define TCHASHSHIFT(x)	((x) >> 4)
 
-static uint32_t	slpque_tablesize;
-static cpumask_t *slpque_cpumasks;
+__read_mostly static uint32_t	slpque_tablesize;
+__read_mostly static cpumask_t *slpque_cpumasks;
 
 SYSCTL_UINT(_kern, OID_AUTO, slpque_tablesize, CTLFLAG_RD, &slpque_tablesize,
     0, "");

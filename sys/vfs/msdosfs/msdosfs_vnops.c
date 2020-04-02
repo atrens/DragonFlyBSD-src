@@ -217,7 +217,7 @@ msdosfs_getattr(struct vop_getattr_args *ap)
 
 	vfs_timestamp(&ts);
 	DETIMES(dep, &ts, &ts, &ts);
-	vap->va_fsid = dev2udev(dep->de_dev);
+	vap->va_fsid = devid_from_dev(dep->de_dev);
 	/*
 	 * The following computation of the fileid must be the same as that
 	 * used in msdosfs_readdir() to compute d_fileno. If not, pwd
@@ -1568,11 +1568,12 @@ msdosfs_readdir(struct vop_readdir_args *ap)
 				switch (n) {
 				case 0:
 					dirbuf.d_namlen = 1;
-					strcpy(dirbuf.d_name, ".");
+					dirbuf.d_name[0] = '.';
 					break;
 				case 1:
 					dirbuf.d_namlen = 2;
-					strcpy(dirbuf.d_name, "..");
+					dirbuf.d_name[0] = '.';
+					dirbuf.d_name[1] = '.';
 					break;
 				}
 				if (vop_write_dirent(&error, uio,

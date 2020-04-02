@@ -42,6 +42,9 @@
 #include <sys/socket.h>
 #include <sys/mount.h>
 #include <sys/procctl.h>
+#if defined(__DragonFly__)
+#include <sys/vmmeter.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -56,6 +59,7 @@
 #include <pthread.h>
 #include <dirent.h>
 #include <termios.h>
+#include <time.h>
 #include <ctype.h>
 
 /*
@@ -67,7 +71,7 @@
 
 struct pkglink;
 
-#define DSYNTH_VERSION	"1.01"
+#define DSYNTH_VERSION	"1.02"
 #define MAXWORKERS	1024
 #define MAXLOGLINES	1024
 #define MAXJOBS		8192	/* just used for -j sanity */
@@ -177,6 +181,8 @@ typedef struct pkg {
 #define PKGF_NOTREADY	0x00010000	/* build_find_leaves() only */
 #define PKGF_MANUALSEL	0x00020000	/* manually specified */
 #define PKGF_META	0x00040000	/* USES contains 'metaport' */
+#define PKGF_DEBUGSTOP	0x00080000	/* freeze slot on completion */
+
 #define PKGF_ERROR	(PKGF_PLACEHOLD | PKGF_CORRUPT | PKGF_NOTFOUND | \
 			 PKGF_FAILURE)
 #define PKGF_NOBUILD	(PKGF_NOBUILD_D | PKGF_NOBUILD_S | PKGF_NOBUILD_F | \
@@ -371,7 +377,8 @@ typedef enum os_id os_id_t;
 #define DLOG_SKIP	4	/* skipped_list.log		*/
 #define DLOG_ABN	5	/* abnormal_command_output	*/
 #define DLOG_OBS	6	/* obsolete_packages.log	*/
-#define DLOG_COUNT	7	/* total number of DLOGs	*/
+#define DLOG_DEBUG	7	/* debug.log 			*/
+#define DLOG_COUNT	8	/* total number of DLOGs	*/
 #define DLOG_MASK	0x0FF
 
 #define DLOG_FILTER	0x100	/* Filter out of stdout in non-curses mode  */
@@ -387,6 +394,9 @@ typedef enum os_id os_id_t;
 
 #define dassert_errno(exp, fmt, ...)	\
 	if (!(exp)) dpanic_errno(fmt, ## __VA_ARGS__)
+
+#define dlog_tab(which, tab, fmt, ...)	\
+	_dlog(which, "%*.*s" fmt, (int)tab, (int)tab, "", ## __VA_ARGS__)
 
 #define dlog(which, fmt, ...)		\
 	_dlog(which, fmt, ## __VA_ARGS__)
@@ -407,7 +417,10 @@ typedef enum os_id os_id_t;
 	_dfatal(__FILE__, __LINE__, __func__, 3, fmt, ## __VA_ARGS__)
 
 #define ddprintf(tab, fmt, ...)		\
-	do { if (DebugOpt >= 2) _ddprintf(tab, fmt, ## __VA_ARGS__); } while(0)
+	do {				\
+	  if (DebugOpt == 1) dlog_tab(DLOG_DEBUG, tab, fmt, ## __VA_ARGS__); \
+	     if (DebugOpt > 1) _ddprintf(tab, fmt, ## __VA_ARGS__);	     \
+	} while(0)
 
 /*
  * addbuildenv() types
@@ -436,6 +449,7 @@ typedef enum os_id os_id_t;
  * RunStats satellite modules
  */
 typedef struct topinfo {
+	int active;
 	int pkgimpulse;
 	int pkgrate;
 	int noswap;
@@ -461,6 +475,8 @@ typedef struct runstats {
 	void (*update)(worker_t *work, const char *portdir);
 	void (*updateTop)(topinfo_t *info);
 	void (*updateLogs)(void);
+	void (*updateCompletion)(worker_t *work, int dlogid,
+				 pkg_t *pkg, const char *reason);
 	void (*sync)(void);
 } runstats_t;
 
@@ -489,10 +505,12 @@ extern int DynamicMaxWorkers;
 extern buildenv_t *BuildEnv;
 extern int WorkerProcFlags;
 extern int DebugOpt;
+extern int MaskProbeAbort;
 extern int ColorOpt;
 extern int SlowStartOpt;
 extern int YesOpt;
 extern int NullStdinOpt;
+extern int DeleteObsoletePkgs;
 extern int UseCCache;
 extern int UseUsrSrc;
 extern int UseTmpfs;
@@ -507,7 +525,7 @@ extern int UseTmpfsBase;
 extern int UseNCurses;
 extern int LeveragePrebuilt;
 extern char *DSynthExecPath;
-
+extern char *ProfileOverrideOpt;
 
 extern const char *OperatingSystemName;
 extern const char *ArchitectureName;
@@ -570,7 +588,7 @@ int dexec_close(FILE *fp, pid_t pid);
 const char *getphasestr(worker_phase_t phase);
 
 void ParseConfiguration(int isworker);
-pkg_t *ParsePackageList(int ac, char **av);
+pkg_t *ParsePackageList(int ac, char **av, int debugstop);
 void FreePackageList(pkg_t *pkgs);
 pkg_t *GetLocalPackageList(void);
 pkg_t *GetFullPackageList(void);
@@ -597,10 +615,13 @@ void RunStatsInit(void);
 void RunStatsDone(void);
 void RunStatsReset(void);
 void RunStatsUpdate(worker_t *work, const char *portdir);
-void RunStatsUpdateTop(void);
+void RunStatsUpdateTop(int active);
 void RunStatsUpdateLogs(void);
 void RunStatsSync(void);
+void RunStatsUpdateCompletion(worker_t *work, int logid,
+			pkg_t *pkg, const char *reason);
 
+int copyfile(char *src, char *dst);
 int ipcreadmsg(int fd, wmsg_t *msg);
 int ipcwritemsg(int fd, wmsg_t *msg);
 extern void MonitorDirective(const char *datfile, const char *lkfile);

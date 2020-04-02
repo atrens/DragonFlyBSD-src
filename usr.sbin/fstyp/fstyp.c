@@ -35,6 +35,8 @@
 #include <sys/stat.h>
 #include <err.h>
 #include <errno.h>
+#include <iconv.h>
+#include <locale.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -45,7 +47,9 @@
 
 #include "fstyp.h"
 
-#define	LABEL_LEN	256
+#define	LABEL_LEN	512
+
+bool show_label = false;
 
 typedef int (*fstyp_function)(FILE *, char *, size_t, const char *);
 typedef int (*fsvtyp_function)(const char *, char *, size_t);
@@ -54,27 +58,30 @@ static struct {
 	const char	*name;
 	fstyp_function	function;
 	bool		unmountable;
+	const char	*precache_encoding;
 } fstypes[] = {
-	{ "cd9660", &fstyp_cd9660, false },
-	{ "exfat", &fstyp_exfat, false },
-	{ "ext2fs", &fstyp_ext2fs, false },
-	{ "msdosfs", &fstyp_msdosfs, false },
-	{ "ntfs", &fstyp_ntfs, false },
-	{ "ufs", &fstyp_ufs, false },
-	{ "hammer", &fstyp_hammer, false },
-	{ "hammer2", &fstyp_hammer2, false },
-	{ NULL, NULL, NULL }
+	{ "apfs", &fstyp_apfs, true, NULL },
+	{ "cd9660", &fstyp_cd9660, false, NULL },
+	{ "exfat", &fstyp_exfat, false, EXFAT_ENC },
+	{ "ext2fs", &fstyp_ext2fs, false, NULL },
+	{ "hfs+", &fstyp_hfsp, false, NULL },
+	{ "msdosfs", &fstyp_msdosfs, false, NULL },
+	{ "ntfs", &fstyp_ntfs, false, NTFS_ENC },
+	{ "ufs", &fstyp_ufs, false, NULL },
+	{ "hammer", &fstyp_hammer, false, NULL },
+	{ "hammer2", &fstyp_hammer2, false, NULL },
+	{ NULL, NULL, NULL, NULL }
 };
 
 static struct {
 	const char	*name;
 	fsvtyp_function	function;
 	bool		unmountable;
+	const char	*precache_encoding;
 } fsvtypes[] = {
-	{ "hammer", &fsvtyp_hammer, false }, /* Must be before partial */
-	{ "hammer(partial)", &fsvtyp_hammer_partial, true },
-	// XXX hammer2 not supported yet
-	{ NULL, NULL, NULL }
+	{ "hammer", &fsvtyp_hammer, false, NULL }, /* Must be before partial */
+	{ "hammer(partial)", &fsvtyp_hammer_partial, true, NULL },
+	{ NULL, NULL, NULL, NULL }
 };
 
 void *
@@ -166,7 +173,7 @@ int
 main(int argc, char **argv)
 {
 	int ch, error, i, nbytes;
-	bool ignore_type = false, show_label = false, show_unmountable = false;
+	bool ignore_type = false, show_unmountable = false;
 	char label[LABEL_LEN + 1], strvised[LABEL_LEN * 4 + 1];
 	char fdpath[MAXPATHLEN];
 	char *p;
@@ -198,6 +205,9 @@ main(int argc, char **argv)
 		usage();
 
 	path = argv[0];
+
+	if (setlocale(LC_CTYPE, "") == NULL)
+		err(1, "setlocale");
 
 	/*
 	 * DragonFly: Filesystems may have syntax to decorate path.

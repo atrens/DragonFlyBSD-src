@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2003,2004-2017 The DragonFly Project.  All rights reserved.
+ * Copyright (c) 2003,2004-2019 The DragonFly Project.  All rights reserved.
  * 
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
@@ -120,18 +120,21 @@ struct namecache {
     struct nchash_head	*nc_head;
     struct namecache	*nc_parent;	/* namecache entry for parent */
     struct vnode	*nc_vp;		/* vnode representing name or NULL */
-    int			nc_refs;	/* ref count prevents deletion */
     u_short		nc_flag;
     u_char		nc_nlen;	/* The length of the name, 255 max */
     u_char		nc_unused;
     char		*nc_name;	/* Separately allocated seg name */
     int			nc_error;
     int			nc_timeout;	/* compared against ticks, or 0 */
-    u_int		nc_lockstatus;	/* namespace locking */
     int			nc_negcpu;	/* which ncneg list are we on? */
-    struct thread	*nc_locktd;	/* namespace locking */
-    u_int		nc_namecache_gen; /* mount generation (autoclear) */
-    u_int		nc_generation;	/* rename/unlink generation */
+    struct {
+	    u_int	nc_namecache_gen; /* mount generation (autoclear) */
+	    u_int	nc_generation;	/* rename/unlink generation */
+	    int		nc_refs;	/* ref count prevents deletion */
+    } __cachealign;
+    struct {
+	    struct lock nc_lock;
+    } __cachealign;
 };
 
 /*
@@ -146,7 +149,7 @@ struct nchandle {
 /*
  * Flags in namecache.nc_flag (u_short)
  */
-#define NCF_UNUSED01	0x0001
+#define NCF_NOTX	0x0001	/* 'x' bit not set in user, group, or world */
 #define NCF_WHITEOUT	0x0002	/* negative entry corresponds to whiteout */
 #define NCF_UNRESOLVED	0x0004	/* invalid or unresolved entry */
 #define NCF_ISMOUNTPT	0x0008	/* someone may have mounted on us here */
@@ -161,11 +164,6 @@ struct nchandle {
 #define NCF_WXOK	0x1000	/* world-searchable (nlookup shortcut) */
 #define NCF_DUMMY	0x2000	/* dummy ncp, iterations ignore it */
 
-#define NC_EXLOCK_REQ	0x80000000	/* nc_lockstatus state flag */
-#define NC_SHLOCK_REQ	0x40000000	/* nc_lockstatus state flag */
-#define NC_SHLOCK_FLAG	0x20000000	/* nc_lockstatus state flag */
-#define NC_SHLOCK_VHOLD	0x10000000	/* nc_lockstatus state flag */
-
 /*
  * cache_inval[_vp]() flags
  */
@@ -179,7 +177,7 @@ struct componentname;
 struct nlcomponent;
 struct mount;
 
-void	cache_clearmntcache(void);
+void	cache_clearmntcache(struct mount *mp);
 void	cache_lock(struct nchandle *nch);
 void	cache_lock_maybe_shared(struct nchandle *nch, int excl);
 void	cache_relock(struct nchandle *nch1, struct ucred *cred1,
@@ -191,8 +189,11 @@ void	cache_setvp(struct nchandle *nch, struct vnode *vp);
 void	cache_settimeout(struct nchandle *nch, int nticks);
 void	cache_setunresolved(struct nchandle *nch);
 void	cache_clrmountpt(struct nchandle *nch);
-struct nchandle cache_nlookup(struct nchandle *nch, struct nlcomponent *nlc);
+struct nchandle cache_nlookup(struct nchandle *nch,
+			struct nlcomponent *nlc);
 struct nchandle cache_nlookup_nonblock(struct nchandle *nch,
+			struct nlcomponent *nlc);
+struct nchandle cache_nlookup_nonlocked(struct nchandle *nch,
 			struct nlcomponent *nlc);
 int	cache_nlookup_maybe_shared(struct nchandle *nch,
 			struct nlcomponent *nlc, int excl,
@@ -213,17 +214,16 @@ void	cache_purge(struct vnode *vp);
 void	cache_purgevfs (struct mount *mp);
 void	cache_hysteresis(int critpath);
 void	cache_get(struct nchandle *nch, struct nchandle *target);
-int	cache_get_nonblock(struct nchandle *nch, struct nchandle *target);
+int	cache_get_nonblock(struct nchandle *nch, int elmno,
+			struct nchandle *target);
 void	cache_get_maybe_shared(struct nchandle *nch,
 			struct nchandle *target, int excl);
 struct nchandle *cache_hold(struct nchandle *nch);
 void	cache_copy(struct nchandle *nch, struct nchandle *target);
-void	cache_copy_ncdir(struct proc *p, struct nchandle *target);
 void	cache_changemount(struct nchandle *nch, struct mount *mp);
 void	cache_put(struct nchandle *nch);
 void	cache_drop(struct nchandle *nch);
-void	cache_drop_and_cache(struct nchandle *nch);
-void	cache_drop_ncdir(struct nchandle *nch);
+void	cache_drop_and_cache(struct nchandle *nch, int elmno);
 void	cache_zero(struct nchandle *nch);
 void	cache_rename(struct nchandle *fnch, struct nchandle *tnch);
 void	cache_unlink(struct nchandle *nch);
@@ -234,6 +234,7 @@ int	cache_fromdvp(struct vnode *, struct ucred *, int, struct nchandle *);
 int	cache_fullpath(struct proc *, struct nchandle *, struct nchandle *,
 			char **, char **, int);
 void	vfscache_rollup_cpu(struct globaldata *gd);
+struct vnode *cache_dvpref(struct namecache *ncp);
 
 #endif
 

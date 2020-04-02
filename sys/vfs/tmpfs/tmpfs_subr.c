@@ -36,7 +36,6 @@
 
 #include <sys/kernel.h>
 #include <sys/param.h>
-#include <sys/namei.h>
 #include <sys/priv.h>
 #include <sys/proc.h>
 #include <sys/stat.h>
@@ -49,6 +48,8 @@
 #include <vm/vm_page.h>
 #include <vm/vm_pager.h>
 #include <vm/vm_extern.h>
+#include <vm/vm_pageout.h>
+#include <vm/vm_page2.h>
 
 #include <vfs/tmpfs/tmpfs.h>
 #include <vfs/tmpfs/tmpfs_vnops.h>
@@ -97,7 +98,7 @@ tmpfs_alloc_node(struct tmpfs_mount *tmp, enum vtype type,
 {
 	struct tmpfs_node *nnode;
 	struct timespec ts;
-	udev_t rdev;
+	dev_t rdev;
 
 	KKASSERT(IFF(type == VLNK, target != NULL));
 	KKASSERT(IFF(type == VBLK || type == VCHR, rmajor != VNOVAL));
@@ -138,6 +139,7 @@ tmpfs_alloc_node(struct tmpfs_mount *tmp, enum vtype type,
 	case VDIR:
 		RB_INIT(&nnode->tn_dir.tn_dirtree);
 		RB_INIT(&nnode->tn_dir.tn_cookietree);
+		nnode->tn_dir.tn_parent = NULL;
 		nnode->tn_size = 0;
 		break;
 
@@ -210,7 +212,6 @@ tmpfs_free_node(struct tmpfs_mount *tmp, struct tmpfs_node *node)
 #ifdef INVARIANTS
 	TMPFS_ASSERT_ELOCKED(node);
 	KKASSERT(node->tn_vnode == NULL);
-	KKASSERT((node->tn_vpstate & TMPFS_VNODE_ALLOCATING) == 0);
 #endif
 
 	TMPFS_LOCK(tmp);
@@ -312,9 +313,7 @@ tmpfs_alloc_dirent(struct tmpfs_mount *tmp, struct tmpfs_node *node,
 
 	nde->td_node = node;
 
-	TMPFS_NODE_LOCK(node);
-	++node->tn_links;
-	TMPFS_NODE_UNLOCK(node);
+	atomic_add_int(&node->tn_links, 1);
 
 	*de = nde;
 
@@ -339,11 +338,8 @@ tmpfs_free_dirent(struct tmpfs_mount *tmp, struct tmpfs_dirent *de)
 
 	node = de->td_node;
 
-	TMPFS_NODE_LOCK(node);
-	TMPFS_ASSERT_ELOCKED(node);
 	KKASSERT(node->tn_links > 0);
-	node->tn_links--;
-	TMPFS_NODE_UNLOCK(node);
+	atomic_add_int(&node->tn_links, -1);
 
 	kfree(de->td_name, tmp->tm_name_zone);
 	de->td_namelen = 0;
@@ -378,13 +374,27 @@ tmpfs_alloc_vp(struct mount *mp,
 	struct vnode *vp;
 
 loop:
+	vp = NULL;
+	if (node->tn_vnode == NULL) {
+		error = getnewvnode(VT_TMPFS, mp, &vp,
+				    VLKTIMEOUT, LK_CANRECURSE);
+		if (error)
+			goto out;
+	}
+
 	/*
 	 * Interlocked extraction from node.  This can race many things.
 	 * We have to get a soft reference on the vnode while we hold
 	 * the node locked, then acquire it properly and check for races.
 	 */
 	TMPFS_NODE_LOCK(node);
-	if ((vp = node->tn_vnode) != NULL) {
+	if (node->tn_vnode) {
+		if (vp) {
+			vp->v_type = VBAD;
+			vx_put(vp);
+		}
+		vp = node->tn_vnode;
+
 		KKASSERT((node->tn_vpstate & TMPFS_VNODE_DOOMED) == 0);
 		vhold(vp);
 		TMPFS_NODE_UNLOCK(node);
@@ -426,40 +436,26 @@ loop:
 		vdrop(vp);
 		goto out;
 	}
-	/* vp is NULL */
+
+	/*
+	 * We need to assign node->tn_vnode.  If vp is NULL, loop up to
+	 * allocate the vp.  This can happen due to SMP races.
+	 */
+	if (vp == NULL) {
+		TMPFS_NODE_UNLOCK(node);
+		goto loop;
+	}
 
 	/*
 	 * This should never happen.
 	 */
 	if (node->tn_vpstate & TMPFS_VNODE_DOOMED) {
 		TMPFS_NODE_UNLOCK(node);
+		vp->v_type = VBAD;
+		vx_put(vp);
 		error = ENOENT;
 		goto out;
 	}
-
-	/*
-	 * Interlock against other calls to tmpfs_alloc_vp() trying to
-	 * allocate and assign a vp to node.
-	 */
-	if (node->tn_vpstate & TMPFS_VNODE_ALLOCATING) {
-		node->tn_vpstate |= TMPFS_VNODE_WANT;
-		error = tsleep(&node->tn_vpstate, PINTERLOCKED | PCATCH,
-			       "tmpfs_alloc_vp", 0);
-		TMPFS_NODE_UNLOCK(node);
-		if (error)
-			return error;
-		goto loop;
-	}
-	node->tn_vpstate |= TMPFS_VNODE_ALLOCATING;
-	TMPFS_NODE_UNLOCK(node);
-
-	/*
-	 * Allocate a new vnode (may block).  The ALLOCATING flag should
-	 * prevent a race against someone else assigning node->tn_vnode.
-	 */
-	error = getnewvnode(VT_TMPFS, mp, &vp, VLKTIMEOUT, LK_CANRECURSE);
-	if (error != 0)
-		goto unlock;
 
 	KKASSERT(node->tn_vnode == NULL);
 	KKASSERT(vp != NULL);
@@ -480,7 +476,7 @@ loop:
 		 * for its tmpfs_strategy().
 		 */
 		vsetflags(vp, VKVABIO);
-		vinitvmio(vp, node->tn_size, TMPFS_BLKSIZE, -1);
+		vinitvmio(vp, node->tn_size, node->tn_blksize, -1);
 		break;
 	case VLNK:
 		break;
@@ -494,22 +490,10 @@ loop:
 		panic("tmpfs_alloc_vp: type %p %d", node, (int)node->tn_type);
 	}
 
-
-unlock:
-	TMPFS_NODE_LOCK(node);
-
-	KKASSERT(node->tn_vpstate & TMPFS_VNODE_ALLOCATING);
-	node->tn_vpstate &= ~TMPFS_VNODE_ALLOCATING;
 	node->tn_vnode = vp;
+	TMPFS_NODE_UNLOCK(node);
 
-	if (node->tn_vpstate & TMPFS_VNODE_WANT) {
-		node->tn_vpstate &= ~TMPFS_VNODE_WANT;
-		TMPFS_NODE_UNLOCK(node);
-		wakeup(&node->tn_vpstate);
-	} else {
-		TMPFS_NODE_UNLOCK(node);
-	}
-
+	vx_downgrade(vp);
 out:
 	*vpp = vp;
 	KKASSERT(IFF(error == 0, *vpp != NULL && vn_islocked(*vpp)));
@@ -609,10 +593,10 @@ tmpfs_dir_attach(struct tmpfs_node *dnode, struct tmpfs_dirent *de)
 	TMPFS_NODE_LOCK(dnode);
 	if (node && node->tn_type == VDIR) {
 		TMPFS_NODE_LOCK(node);
-		++node->tn_links;
+		atomic_add_int(&node->tn_links, 1);
 		node->tn_status |= TMPFS_NODE_CHANGED;
 		node->tn_dir.tn_parent = dnode;
-		++dnode->tn_links;
+		atomic_add_int(&dnode->tn_links, 1);
 		TMPFS_NODE_UNLOCK(node);
 	}
 	RB_INSERT(tmpfs_dirtree, &dnode->tn_dir.tn_dirtree, de);
@@ -658,8 +642,8 @@ tmpfs_dir_detach(struct tmpfs_node *dnode, struct tmpfs_dirent *de)
 		TMPFS_NODE_LOCK(dnode);
 		TMPFS_NODE_LOCK(node);
 		KKASSERT(node->tn_dir.tn_parent == dnode);
-		dnode->tn_links--;
-		node->tn_links--;
+		atomic_add_int(&dnode->tn_links, -1);
+		atomic_add_int(&node->tn_links, -1);
 		node->tn_dir.tn_parent = NULL;
 		TMPFS_NODE_UNLOCK(node);
 		TMPFS_NODE_UNLOCK(dnode);
@@ -693,7 +677,7 @@ tmpfs_dir_lookup(struct tmpfs_node *node, struct tmpfs_node *f,
 
 	de = RB_FIND(tmpfs_dirtree, &node->tn_dir.tn_dirtree, &wanted);
 
-	KKASSERT(f == NULL || f == de->td_node);
+	KKASSERT(f == NULL || de == NULL || f == de->td_node);
 
 	return de;
 }
@@ -924,7 +908,7 @@ tmpfs_dir_getdents(struct tmpfs_node *node, struct uio *uio, off_t *cntp)
  * the size newsize.  'vp' must point to a vnode that represents a regular
  * file.  'newsize' must be positive.
  *
- * pass trivial as 1 when buf content will be overwritten, otherwise set 0
+ * pass NVEXTF_TRIVIAL when buf content will be overwritten, otherwise set 0
  * to be zero filled.
  *
  * Returns zero on success or an appropriate error code on failure.
@@ -939,6 +923,7 @@ tmpfs_reg_resize(struct vnode *vp, off_t newsize, int trivial)
 	struct tmpfs_mount *tmp;
 	struct tmpfs_node *node;
 	off_t oldsize;
+	int nvextflags;
 
 #ifdef INVARIANTS
 	KKASSERT(vp->v_type == VREG);
@@ -971,6 +956,17 @@ tmpfs_reg_resize(struct vnode *vp, off_t newsize, int trivial)
 		atomic_add_long(&tmp->tm_pages_used, (newpages - oldpages));
 
 	/*
+	 * nvextflags to pass along for bdwrite() vs buwrite()
+	 */
+	if (vm_pages_needed || vm_paging_needed(0) ||
+	    tmpfs_bufcache_mode >= 2) {
+		nvextflags = 0;
+	} else {
+		nvextflags = NVEXTF_BUWRITE;
+	}
+
+
+	/*
 	 * When adjusting the vnode filesize and its VM object we must
 	 * also adjust our backing VM object (aobj).  The blocksize
 	 * used must match the block sized we use for the buffer cache.
@@ -978,13 +974,20 @@ tmpfs_reg_resize(struct vnode *vp, off_t newsize, int trivial)
 	 * The backing VM object may contain VM pages as well as swap
 	 * assignments if we previously renamed main object pages into
 	 * it during deactivation.
+	 *
+	 * To make things easier tmpfs uses a blksize in multiples of
+	 * PAGE_SIZE, and will only increase the blksize as a small file
+	 * increases in size.  Once a file has exceeded TMPFS_BLKSIZE (16KB),
+	 * the blksize is maxed out.  Truncating the file does not reduce
+	 * the blksize.
 	 */
 	if (newsize < oldsize) {
 		vm_pindex_t osize;
 		vm_pindex_t nsize;
 		vm_object_t aobj;
 
-		error = nvtruncbuf(vp, newsize, TMPFS_BLKSIZE, -1, 0);
+		error = nvtruncbuf(vp, newsize, node->tn_blksize,
+				   -1, nvextflags);
 		aobj = node->tn_reg.tn_aobj;
 		if (aobj) {
 			osize = aobj->size;
@@ -999,10 +1002,25 @@ tmpfs_reg_resize(struct vnode *vp, off_t newsize, int trivial)
 		}
 	} else {
 		vm_object_t aobj;
+		int nblksize;
+
+		/*
+		 * The first (and only the first) buffer in the file is resized
+		 * in multiples of PAGE_SIZE, up to TMPFS_BLKSIZE.
+		 */
+		nblksize = node->tn_blksize;
+		while (nblksize < TMPFS_BLKSIZE &&
+		       nblksize < newsize) {
+			nblksize += PAGE_SIZE;
+		}
+
+		if (trivial)
+			nvextflags |= NVEXTF_TRIVIAL;
 
 		error = nvextendbuf(vp, oldsize, newsize,
-				    TMPFS_BLKSIZE, TMPFS_BLKSIZE,
-				    -1, -1, trivial);
+				    node->tn_blksize, nblksize,
+				    -1, -1, nvextflags);
+		node->tn_blksize = nblksize;
 		aobj = node->tn_reg.tn_aobj;
 		if (aobj)
 			aobj->size = vp->v_object->size;
@@ -1256,8 +1274,9 @@ tmpfs_itimes(struct vnode *vp, const struct timespec *acc,
 	node = VP_TO_TMPFS_NODE(vp);
 
 	if ((node->tn_status & (TMPFS_NODE_ACCESSED | TMPFS_NODE_MODIFIED |
-	    TMPFS_NODE_CHANGED)) == 0)
+	    TMPFS_NODE_CHANGED)) == 0) {
 		return;
+	}
 
 	vfs_timestamp(&now);
 
@@ -1362,4 +1381,31 @@ tmpfs_dirtree_compare_cookie(struct tmpfs_dirent *a, struct tmpfs_dirent *b)
 	if (a > b)
 		return(1);
 	return 0;
+}
+
+/*
+ * Lock for rename.  The namecache entries are already locked so
+ * theoretically we should be able to lock the directories in any
+ * order.  Underlying files must be locked after the related directory.
+ */
+void
+tmpfs_lock4(struct tmpfs_node *node1, struct tmpfs_node *node2,
+	    struct tmpfs_node *node3, struct tmpfs_node *node4)
+{
+	TMPFS_NODE_LOCK(node1);		/* fdir */
+	TMPFS_NODE_LOCK(node3);		/* ffile */
+	TMPFS_NODE_LOCK(node2);		/* tdir */
+	if (node4)
+		TMPFS_NODE_LOCK(node4);	/* tfile */
+}
+
+void
+tmpfs_unlock4(struct tmpfs_node *node1, struct tmpfs_node *node2,
+	      struct tmpfs_node *node3, struct tmpfs_node *node4)
+{
+	if (node4)
+		TMPFS_NODE_UNLOCK(node4);
+	TMPFS_NODE_UNLOCK(node2);
+	TMPFS_NODE_UNLOCK(node3);
+	TMPFS_NODE_UNLOCK(node1);
 }

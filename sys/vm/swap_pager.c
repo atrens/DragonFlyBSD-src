@@ -193,15 +193,19 @@ SYSCTL_LONG(_vm, OID_AUTO, swap_cache_use,
         CTLFLAG_RD, &vm_swap_cache_use, 0, "");
 SYSCTL_LONG(_vm, OID_AUTO, swap_anon_use,
         CTLFLAG_RD, &vm_swap_anon_use, 0, "");
-SYSCTL_LONG(_vm, OID_AUTO, swap_size,
+SYSCTL_LONG(_vm, OID_AUTO, swap_free,
         CTLFLAG_RD, &vm_swap_size, 0, "");
+SYSCTL_LONG(_vm, OID_AUTO, swap_size,
+        CTLFLAG_RD, &vm_swap_max, 0, "");
 #else
 SYSCTL_INT(_vm, OID_AUTO, swap_cache_use,
         CTLFLAG_RD, &vm_swap_cache_use, 0, "");
 SYSCTL_INT(_vm, OID_AUTO, swap_anon_use,
         CTLFLAG_RD, &vm_swap_anon_use, 0, "");
-SYSCTL_INT(_vm, OID_AUTO, swap_size,
+SYSCTL_INT(_vm, OID_AUTO, swap_free,
         CTLFLAG_RD, &vm_swap_size, 0, "");
+SYSCTL_INT(_vm, OID_AUTO, swap_size,
+        CTLFLAG_RD, &vm_swap_max, 0, "");
 #endif
 SYSCTL_INT(_vm, OID_AUTO, report_swap_allocs,
         CTLFLAG_RW, &vm_report_swap_allocs, 0, "");
@@ -615,6 +619,8 @@ swp_pager_freeswapspace(vm_object_t object, swblk_t blk, int npages)
 void
 swap_pager_freespace(vm_object_t object, vm_pindex_t start, vm_pindex_t size)
 {
+	if (object->swblock_count == 0)
+		return;
 	vm_object_hold(object);
 	swp_pager_meta_free(object, start, size);
 	vm_object_drop(object);
@@ -626,6 +632,8 @@ swap_pager_freespace(vm_object_t object, vm_pindex_t start, vm_pindex_t size)
 void
 swap_pager_freespace_all(vm_object_t object)
 {
+	if (object->swblock_count == 0)
+		return;
 	vm_object_hold(object);
 	swp_pager_meta_free_all(object);
 	vm_object_drop(object);

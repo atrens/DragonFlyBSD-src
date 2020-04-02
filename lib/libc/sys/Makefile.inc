@@ -69,8 +69,8 @@ MAN+=	_exit.2 accept.2 access.2 acct.2 adjtime.2 bind.2 \
 	fcntl.2 fhopen.2 flock.2 fork.2 fsync.2 \
 	getdirentries.2 getdtablesize.2 \
 	getfh.2 getfsstat.2 getgid.2 getgroups.2 getitimer.2 getlogin.2 \
-	getpeername.2 getpgrp.2 getpid.2 getpriority.2 getrlimit.2 \
-	getrusage.2 getsid.2 getsockname.2 \
+	getpeername.2 getpgrp.2 getpid.2 getpriority.2 getrandom.2 \
+	getrlimit.2 getrusage.2 getsid.2 getsockname.2 \
 	getsockopt.2 gettimeofday.2 getuid.2 \
 	intro.2 ioctl.2 ioprio_get.2 issetugid.2 \
 	jail.2 jail_attach.2 kenv.2 kill.2 \
@@ -87,7 +87,7 @@ MAN+=	_exit.2 accept.2 access.2 acct.2 adjtime.2 bind.2 \
 	pathconf.2 pipe.2 poll.2 procctl.2 profil.2 pselect.2 ptrace.2 \
 	quotactl.2 \
 	read.2 readlink.2 reboot.2 recv.2 rename.2 revoke.2 rfork.2 rmdir.2 \
-	rtprio.2 \
+	rtprio.2 __realpath.2 \
 	sbrk.2 sched_getcpu.2 sched_get_priority_max.2 sched_setaffinity.2 \
 	sched_setparam.2 sched_setscheduler.2 sched_yield.2 \
 	select.2 semctl.2 semget.2 semop.2 send.2 sendfile.2 \

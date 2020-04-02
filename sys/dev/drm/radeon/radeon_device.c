@@ -1427,30 +1427,29 @@ int radeon_device_init(struct radeon_device *rdev,
 
 	/* Registers mapping */
 	/* TODO: block userspace mapping of io register */
-	spin_init(&rdev->mmio_idx_lock,  "radeon_mpio");
-	spin_init(&rdev->smc_idx_lock,   "radeon_smc");
-	spin_init(&rdev->pll_idx_lock,   "radeon_pll");
-	spin_init(&rdev->mc_idx_lock,    "radeon_mc");
-	spin_init(&rdev->pcie_idx_lock,  "radeon_pcie");
-	spin_init(&rdev->pciep_idx_lock, "radeon_pciep");
-	spin_init(&rdev->pif_idx_lock,   "radeon_pif");
-	spin_init(&rdev->cg_idx_lock,    "radeon_cg");
-	spin_init(&rdev->uvd_idx_lock,   "radeon_uvd");
-	spin_init(&rdev->rcu_idx_lock,   "radeon_rcu");
-	spin_init(&rdev->didt_idx_lock,  "radeon_didt");
-	spin_init(&rdev->end_idx_lock,   "radeon_end");
+	lockinit(&rdev->mmio_idx_lock, "rdnmidl", 0, 0);
+	lockinit(&rdev->smc_idx_lock, "rdnsil", 0, 0);
+	lockinit(&rdev->pll_idx_lock, "rdnpll", 0, 0);
+	lockinit(&rdev->mc_idx_lock, "rdnmcil", 0, 0);
+	lockinit(&rdev->pcie_idx_lock, "rdnpil", 0, 0);
+	lockinit(&rdev->pciep_idx_lock, "rdnppil", 0, 0);
+	lockinit(&rdev->pif_idx_lock, "rdnpif", 0, 0);
+	lockinit(&rdev->cg_idx_lock, "rdncgil", 0, 0);
+	lockinit(&rdev->uvd_idx_lock, "rdnuvd", 0, 0);
+	lockinit(&rdev->rcu_idx_lock, "rdnrcu", 0, 0);
+	lockinit(&rdev->didt_idx_lock, "rdndidt", 0, 0);
+	lockinit(&rdev->end_idx_lock, "rdneil", 0, 0);
 	if (rdev->family >= CHIP_BONAIRE) {
-		rdev->rmmio_rid = PCIR_BAR(5);
+		rdev->rmmio_base = pci_resource_start(rdev->pdev, 5);
+		rdev->rmmio_size = pci_resource_len(rdev->pdev, 5);
 	} else {
-		rdev->rmmio_rid = PCIR_BAR(2);
+		rdev->rmmio_base = pci_resource_start(rdev->pdev, 2);
+		rdev->rmmio_size = pci_resource_len(rdev->pdev, 2);
 	}
-	rdev->rmmio = bus_alloc_resource_any(rdev->dev->bsddev, SYS_RES_MEMORY,
-	    &rdev->rmmio_rid, RF_ACTIVE | RF_SHAREABLE);
+	rdev->rmmio = ioremap(rdev->rmmio_base, rdev->rmmio_size);
 	if (rdev->rmmio == NULL) {
 		return -ENOMEM;
 	}
-	rdev->rmmio_base = rman_get_start(rdev->rmmio);
-	rdev->rmmio_size = rman_get_size(rdev->rmmio);
 	DRM_INFO("register mmio base: 0x%08X\n", (uint32_t)rdev->rmmio_base);
 	DRM_INFO("register mmio size: %u\n", (unsigned)rdev->rmmio_size);
 
@@ -1615,8 +1614,7 @@ void radeon_device_fini(struct radeon_device *rdev)
 		bus_release_resource(rdev->dev->bsddev, SYS_RES_IOPORT, rdev->rio_rid,
 		    rdev->rio_mem);
 	rdev->rio_mem = NULL;
-	bus_release_resource(rdev->dev->bsddev, SYS_RES_MEMORY, rdev->rmmio_rid,
-	    rdev->rmmio);
+	iounmap(rdev->rmmio);
 	rdev->rmmio = NULL;
 	if (rdev->family >= CHIP_BONAIRE)
 		radeon_doorbell_fini(rdev);

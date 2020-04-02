@@ -3,10 +3,15 @@ KMOD	= i915
 # core driver code
 SRCS =	i915_drv.c \
 	i915_irq.c \
+	i915_memcpy.c \
+	i915_mm.c \
 	i915_params.c \
+	i915_pci.c \
 	i915_suspend.c \
+	i915_sw_fence.c \
 	i915_sysfs.c \
 	intel_csr.c \
+	intel_device_info.c \
 	intel_pm.c \
 	intel_runtime_pm.c
 
@@ -21,11 +26,13 @@ SRCS +=	i915_cmd_parser.c \
 	i915_gem_gtt.c \
 	i915_gem.c \
 	i915_gem_render_state.c \
+	i915_gem_request.c \
 	i915_gem_shrinker.c \
 	i915_gem_stolen.c \
 	i915_gem_tiling.c \
 	i915_gem_userptr.c \
-	i915_gpu_error.c \
+	intel_breadcrumbs.c \
+	intel_engine_cs.c \
 	intel_lrc.c \
 	intel_mocs.c \
 	intel_ringbuffer.c \
@@ -50,6 +57,7 @@ SRCS += \
 	intel_bios.c \
 	intel_color.c \
 	intel_display.c \
+	intel_dpio_phy.c \
 	intel_dpll_mgr.c \
 	intel_fbc.c \
 	intel_fifo_underrun.c \
@@ -73,28 +81,40 @@ SRCS += \
 	dvo_tfp410.c \
 	intel_crt.c \
 	intel_ddi.c \
+	intel_dp_aux_backlight.c \
 	intel_dp_link_training.c \
 	intel_dp_mst.c \
 	intel_dp.c \
 	intel_dsi.c \
+	intel_dsi_dcs_backlight.c \
 	intel_dsi_panel_vbt.c \
 	intel_dsi_pll.c \
 	intel_dvo.c \
 	intel_hdmi.c \
 	intel_i2c.c \
+	intel_lspcon.c \
 	intel_lvds.c \
 	intel_panel.c \
 	intel_sdvo.c \
 	intel_tv.c
 
+# Post-mortem debug and GPU hang state capture
+#i915-$(CONFIG_DRM_I915_CAPTURE_ERROR) += i915_gpu_error.o
+
 # virtual gpu code
 SRCS += i915_vgpu.c
 
-# legacy horrors
-SRCS += i915_dma.c
+# CONFIG_DRM_I915_GVT
+#SRCS += intel_gvt.c
 
-SRCS   += acpi_if.h device_if.h bus_if.h pci_if.h \
-	  opt_acpi.h opt_drm.h
+SRCS += \
+	opt_acpi.h \
+	opt_ddb.h \
+	opt_drm.h \
+	acpi_if.h \
+	bus_if.h \
+	device_if.h \
+	pci_if.h
 
 KCFLAGS+= -I${SYSDIR}/dev/drm/include
 KCFLAGS+= -I${SYSDIR}/dev/drm/include/uapi

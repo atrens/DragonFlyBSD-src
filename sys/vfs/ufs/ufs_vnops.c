@@ -321,7 +321,7 @@ ufs_getattr(struct vop_getattr_args *ap)
 	/*
 	 * Copy from inode table
 	 */
-	vap->va_fsid = dev2udev(ip->i_dev);
+	vap->va_fsid = devid_from_dev(ip->i_dev);
 	vap->va_fileid = ip->i_number;
 	vap->va_mode = ip->i_mode & ~IFMT;
 	vap->va_nlink = VFSTOUFS(vp->v_mount)->um_i_effnlink_valid ?
@@ -398,11 +398,13 @@ ufs_setattr(struct vop_setattr_args *ap)
 			return (error);
 		/*
 		 * Note that a root chflags becomes a user chflags when
-		 * we are jailed, unless the jail.chflags_allowed sysctl
+		 * we are jailed, unless the jail vfs_chflags sysctl
 		 * is set.
 		 */
-		if (cred->cr_uid == 0 && 
-		    (!jailed(cred) || jail_chflags_allowed)) {
+		if (cred->cr_uid == 0 &&
+		    (!jailed(cred) ||
+			PRISON_CAP_ISSET(cred->cr_prison->pr_caps,
+			    PRISON_CAP_VFS_CHFLAGS))) {
 			if ((ip->i_flags
 			    & (SF_NOUNLINK | SF_IMMUTABLE | SF_APPEND)) &&
 			    securelevel > 0)

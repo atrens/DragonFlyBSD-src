@@ -133,7 +133,6 @@ struct ttm_tt {
  * struct ttm_dma_tt
  *
  * @ttm: Base ttm_tt struct.
- * @cpu_address: The CPU address of the pages
  * @dma_address: The DMA (bus) addresses of the pages
  * @pages_list: used by some page allocation backend
  *
@@ -143,7 +142,6 @@ struct ttm_tt {
  */
 struct ttm_dma_tt {
 	struct ttm_tt ttm;
-	void **cpu_address;
 	dma_addr_t *dma_address;
 	struct list_head pages_list;
 };
@@ -287,7 +285,7 @@ struct ttm_mem_type_manager {
 	struct lock io_reserve_mutex;
 	bool use_io_reserve_lru;
 	bool io_reserve_fastpath;
-	struct spinlock move_lock;
+	spinlock_t move_lock;
 
 	/*
 	 * Protected by @io_reserve_mutex:

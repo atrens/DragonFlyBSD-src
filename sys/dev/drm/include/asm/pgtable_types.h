@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015-2018 François Tigeot <ftigeot@wolfpond.org>
+ * Copyright (c) 2015-2020 François Tigeot <ftigeot@wolfpond.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -47,6 +47,7 @@
 #define __PAGE_KERNEL	(__PAGE_KERNEL_EXEC | _PAGE_NX)
 
 #define PAGE_KERNEL	__PAGE_KERNEL
+#define PAGE_KERNEL_IO	__PAGE_KERNEL
 
 static inline pgprot_t
 pgprot_writecombine(pgprot_t prot)

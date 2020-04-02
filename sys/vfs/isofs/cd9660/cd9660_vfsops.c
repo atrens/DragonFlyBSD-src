@@ -82,6 +82,7 @@ static int cd9660_checkexp(struct mount *, struct sockaddr *,
 static int cd9660_vptofh (struct vnode *, struct fid *);
 
 static struct vfsops cd9660_vfsops = {
+	.vfs_flags =		0,
 	.vfs_mount =		cd9660_mount,
 	.vfs_unmount =		cd9660_unmount,
 	.vfs_root =		cd9660_root,
@@ -436,7 +437,7 @@ iso_mountfs(struct vnode *devvp, struct mount *mp, struct iso_args *argp)
 	pribp = NULL;
 
 	mp->mnt_data = (qaddr_t)isomp;
-	mp->mnt_stat.f_fsid.val[0] = dev2udev(dev);
+	mp->mnt_stat.f_fsid.val[0] = devid_from_dev(dev);
 	mp->mnt_stat.f_fsid.val[1] = mp->mnt_vfc->vfc_typenum;
 	mp->mnt_maxsymlinklen = 0;
 	mp->mnt_flag |= MNT_LOCAL;
@@ -888,6 +889,7 @@ again:
 	/*
 	 * Return the locked and refd vp
 	 */
+	vx_downgrade(vp);
 	*vpp = vp;
 	return (0);
 }
